@@ -113,27 +113,555 @@ def _load_history() -> list:
         return []
 from groq import Groq as _Groq
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SMART CHART SELECTION — question + dataframe → chart type
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Intent detection
+# ---------------------------------------------------------------------------
+
+# Keyword lists are ordered by specificity: more-specific patterns first so
+# that a question like "percentage breakdown by year" resolves to "share"
+# rather than "trend".
+
+_TREND_KW = frozenset([
+    "trend", "over time", "time series", "over the year", "over the years",
+    "by year", "by month", "by quarter", "by week", "by day", "daily",
+    "monthly", "quarterly", "yearly", "annually", "timeline", "growth",
+    "change over", "historical", "progression", "evolution", "time",
+])
+
+_SHARE_KW = frozenset([
+    "share", "proportion", "percentage", "percent", "% of", "ratio",
+    "composition", "make up", "makes up", "portion", "fraction",
+    "pie", "split", "breakdown by",
+])
+
+_DIST_KW = frozenset([
+    "distribution", "histogram", "spread", "range", "frequency",
+    "how many", "count of", "how often", "bins", "bucket", "buckets",
+])
+
+_RELATION_KW = frozenset([
+    "relationship", "correlation", "correlate", "relate", "impact",
+    "affect", "influence", "scatter", "vs", "versus", "against",
+    "price vs", "mileage vs", "mpg vs", "compared to",
+])
+
+_COMPARE_KW = frozenset([
+    "compare", "comparison", "difference between", "which is",
+    "rank", "ranking", "top", "bottom", "best", "worst",
+    "highest", "lowest", "most", "least", "average", "avg",
+    "by fuel", "by transmission", "by model", "by type", "by category",
+    "between", "cheapest", "expensive",
+])
+
+
+def _question_intent(q: str, numeric_cols: list, text_cols: list,
+                     time_col: "str | None", n: int) -> str:
+    """
+    Return one of: "trend" | "share" | "distribution" | "relation" | "compare"
+
+    Priority order (highest → lowest):
+      1. Trend keywords  (most unambiguous — user explicitly wants time axis)
+      2. Share keywords  (explicitly proportional)
+      3. Distribution    (explicitly about spread/frequency)
+      4. Relation        (two-numeric correlation, or explicit scatter ask)
+      5. Compare         (everything else with categories + numbers)
+      6. Structural fall-through
+    """
+    ql = q.lower()
+
+    def _hit(kws: frozenset) -> bool:
+        return any(kw in ql for kw in kws)
+
+    # 1. Trend — explicit time words OR a detected time column in the result
+    if _hit(_TREND_KW) or (time_col is not None):
+        return "trend"
+
+    # 2. Share — proportion / percentage intent (check before compare so
+    #    "percentage breakdown" doesn't collapse to compare)
+    if _hit(_SHARE_KW) and text_cols and numeric_cols:
+        return "share"
+
+    # 3. Distribution — spread/frequency questions
+    if _hit(_DIST_KW) and numeric_cols:
+        return "distribution"
+
+    # 4. Relationship — scatter / correlation questions or 2 numeric cols
+    if (_hit(_RELATION_KW) and len(numeric_cols) >= 2) or (
+        len(numeric_cols) >= 2 and not text_cols and n > 20
+    ):
+        return "relation"
+
+    # 5. Comparison — explicit compare words or default when we have
+    #    a text category column alongside a numeric one
+    if _hit(_COMPARE_KW) or (text_cols and numeric_cols):
+        return "compare"
+
+    # 6. Structural fall-through
+    if len(numeric_cols) >= 2:
+        return "relation"
+    return "compare"
+
+
+# ---------------------------------------------------------------------------
+# Pie-safety guard
+# ---------------------------------------------------------------------------
+
+def _pie_safe(df: "pd.DataFrame", x_col: str) -> bool:
+    """
+    Return True only when a pie chart would be meaningful:
+      - x column exists
+      - more than one unique category
+      - not too many slices (≤ 12 is readable)
+    """
+    if x_col not in df.columns:
+        return False
+    n_unique = df[x_col].nunique()
+    return 1 < n_unique <= 12
+
+
+# ---------------------------------------------------------------------------
+# Main config builder
+# ---------------------------------------------------------------------------
+
+def _pick_chart_config(question: str, df: "pd.DataFrame") -> dict:
+    """
+    Decide the best primary + secondary chart types based on:
+      1. Keyword signals in the user's question
+      2. The structure of the resulting DataFrame
+
+    Returns a dict:
+      intent, primary, secondary, x, y, y2, color_col, chart_label
+    """
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    text_cols    = df.select_dtypes(exclude="number").columns.tolist()
+    n            = len(df)
+
+    # Detect time-axis column by name heuristic
+    _TIME_NAME_KWS = ("year", "date", "month", "week", "quarter", "period", "day", "time")
+    time_col = next(
+        (c for c in df.columns if any(kw in c.lower() for kw in _TIME_NAME_KWS)),
+        None,
+    )
+
+    intent = _question_intent(question, numeric_cols, text_cols, time_col, n)
+
+    # ── Assign x / y columns based on intent ─────────────────────────────────
+    y  = numeric_cols[0] if numeric_cols else (df.columns[-1] if len(df.columns) else None)
+    y2 = numeric_cols[1] if len(numeric_cols) > 1 else y
+
+    if intent == "trend":
+        # x must be the time axis
+        if time_col:
+            x = time_col
+        elif text_cols:
+            x = text_cols[0]
+        else:
+            # All-numeric: treat first col as x, second as y
+            x = numeric_cols[0]
+            y = numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
+    elif intent == "relation":
+        # Both axes are numeric
+        x = numeric_cols[0]
+        y = numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
+    else:
+        x = text_cols[0] if text_cols else df.columns[0]
+
+    # ── Primary chart ─────────────────────────────────────────────────────────
+    if intent == "trend":
+        primary = "line"
+
+    elif intent == "share":
+        # Guard: only use pie if there are multiple distinct categories
+        primary = "pie" if _pie_safe(df, x) else "bar"
+
+    elif intent == "distribution":
+        primary = "histogram"
+
+    elif intent == "relation":
+        primary = "scatter"
+
+    else:  # compare (default)
+        # Horizontal bar for ≤ 15 rows (easier to read labels), vertical for more
+        primary = "bar_h" if n <= 15 else "bar"
+
+    # ── Secondary chart (companion panel) ─────────────────────────────────────
+    secondary: "str | None"
+    if intent == "trend":
+        # Show a secondary bar to surface top performers alongside the trend
+        secondary = "bar_h" if (text_cols and n <= 20) else None
+
+    elif intent == "share":
+        # Companion bar for the same data — easier to compare exact values
+        secondary = "bar_h" if n <= 15 else "bar"
+
+    elif intent == "distribution":
+        # No useful companion for a histogram
+        secondary = None
+
+    elif intent == "relation":
+        # Companion bar/pie if there are categories to break down by
+        if text_cols:
+            secondary = "bar_h" if n <= 15 else "bar"
+        elif len(numeric_cols) >= 3:
+            secondary = "scatter"   # second scatter with a different y axis
+        else:
+            secondary = None
+
+    else:  # compare
+        # Companion pie only when safe; otherwise a second numeric scatter
+        if _pie_safe(df, x):
+            secondary = "pie"
+        elif len(numeric_cols) >= 2:
+            secondary = "scatter"
+        else:
+            secondary = None
+
+    # ── Human-readable label ──────────────────────────────────────────────────
+    _labels = {
+        "trend":        "Trend Over Time",
+        "share":        "Share & Proportion",
+        "distribution": "Distribution",
+        "relation":     "Relationship",
+        "compare":      "Category Comparison",
+    }
+
+    return dict(
+        intent      = intent,
+        primary     = primary,
+        secondary   = secondary,
+        x           = x,
+        y           = y,
+        y2          = y2,
+        color_col   = text_cols[0] if text_cols and intent == "relation" else None,
+        chart_label = _labels[intent],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Figure builders
+# ---------------------------------------------------------------------------
+
+def _pie_layout(CHART_DISC, BG_PAGE, FONT_CLR) -> dict:
+    """Shared layout kwargs for a donut/pie chart."""
+    return dict(
+        paper_bgcolor = "rgba(0,0,0,0)",
+        font          = dict(family="Space Grotesk", color=FONT_CLR),
+        margin        = dict(l=10, r=10, t=35, b=10),
+        showlegend    = True,
+        legend        = dict(bgcolor="rgba(0,0,0,0)", font=dict(color=FONT_CLR, size=10)),
+    )
+
+
+def _build_primary_fig(cfg: dict, df: "pd.DataFrame", TL: dict) -> "go.Figure":
+    """
+    Build the primary Plotly figure from a chart config dict.
+    All bar charts are sorted descending and capped at 15 rows.
+    Pie charts are only rendered when _pie_safe() is satisfied (guaranteed
+    by _pick_chart_config, but double-checked here as a safety net).
+    """
+    p            = cfg["primary"]
+    x            = cfg["x"]
+    y            = cfg["y"]
+    n            = len(df)
+    text_cols    = df.select_dtypes(exclude="number").columns.tolist()
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    lbl          = {c: c.replace("_", " ").title() for c in df.columns}
+
+    # ── Line chart — sorted by x axis ─────────────────────────────────────────
+    if p == "line":
+        _color = text_cols[0] if (text_cols and text_cols[0] != x) else None
+        fig = px.line(
+            df.sort_values(x) if x in df.columns else df,
+            x=x, y=y,
+            color=_color,
+            color_discrete_sequence=CHART_DISC,
+            labels=lbl,
+            markers=True,
+        )
+        fig.update_traces(line_width=2.5, marker_size=6)
+        fig.update_layout(**TL)
+
+    # ── Horizontal bar — sorted desc, top-15 ──────────────────────────────────
+    elif p == "bar_h":
+        _df_plot = df.sort_values(y, ascending=False).head(15)
+        # Re-sort ascending so the tallest bar is at the top of a horizontal chart
+        _df_plot = _df_plot.sort_values(y, ascending=True)
+        fig = px.bar(
+            _df_plot,
+            x=y, y=x, orientation="h",
+            color=y, color_continuous_scale=CHART_SEQ,
+            labels=lbl,
+        )
+        fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+        fig.update_layout(**TL)
+
+    # ── Vertical bar — sorted desc, top-15 ────────────────────────────────────
+    elif p == "bar":
+        _df_plot = df.sort_values(y, ascending=False).head(15)
+        fig = px.bar(
+            _df_plot,
+            x=x, y=y,
+            color=y, color_continuous_scale=CHART_SEQ,
+            labels=lbl,
+        )
+        fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+        fig.update_layout(**TL)
+
+    # ── Histogram ─────────────────────────────────────────────────────────────
+    elif p == "histogram":
+        fig = px.histogram(
+            df, x=y,
+            color=text_cols[0] if text_cols else None,
+            color_discrete_sequence=CHART_DISC,
+            nbins=min(30, max(10, n // 5)),
+            labels=lbl,
+            opacity=0.85,
+        )
+        fig.update_traces(marker_line_width=0)
+        fig.update_layout(**TL)
+
+    # ── Pie / donut — with fallback to bar if not pie-safe ────────────────────
+    elif p == "pie":
+        if _pie_safe(df, x):
+            fig = go.Figure(go.Pie(
+                labels=df[x],
+                values=df[y],
+                hole=0.52,
+                marker=dict(colors=CHART_DISC, line=dict(color=BG_PAGE, width=2)),
+                textfont=dict(family="Space Grotesk", size=11, color=FONT_CLR),
+            ))
+            fig.update_layout(**_pie_layout(CHART_DISC, BG_PAGE, FONT_CLR))
+            return fig   # pie manages its own layout — return early
+        else:
+            # Fallback: render as a sorted horizontal bar
+            _df_plot = df.sort_values(y, ascending=False).head(15)
+            _df_plot = _df_plot.sort_values(y, ascending=True)
+            fig = px.bar(
+                _df_plot,
+                x=y, y=x, orientation="h",
+                color=y, color_continuous_scale=CHART_SEQ,
+                labels=lbl,
+            )
+            fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+            fig.update_layout(**TL)
+
+    # ── Scatter — with OLS trendline when enough points ───────────────────────
+    elif p == "scatter":
+        x_col = x if x in numeric_cols else (numeric_cols[0] if numeric_cols else x)
+        y_col = y if y in numeric_cols else (numeric_cols[1] if len(numeric_cols) > 1 else y)
+        _color_arg = cfg.get("color_col") or (text_cols[0] if text_cols else None)
+        fig = px.scatter(
+            df, x=x_col, y=y_col,
+            color=_color_arg,
+            color_discrete_sequence=CHART_DISC,
+            opacity=0.80,
+            labels=lbl,
+            trendline=None,  # statsmodels not required
+        )
+        fig.update_traces(marker_size=8, marker_line_width=0)
+        fig.update_layout(**TL)
+
+    # ── Safe fallback ─────────────────────────────────────────────────────────
+    else:
+        _df_plot = df.sort_values(y, ascending=False).head(15)
+        fig = px.bar(_df_plot, x=x, y=y, color=y,
+                     color_continuous_scale=CHART_SEQ, labels=lbl)
+        fig.update_traces(marker_line_width=0, marker_cornerradius=4)
+        fig.update_layout(**TL)
+
+    return fig
+
+
+def _build_secondary_fig(cfg: dict, df: "pd.DataFrame", TL: dict) -> "go.Figure | None":
+    """
+    Build the secondary/companion Plotly figure.
+    Returns None when no meaningful companion chart can be built.
+    All bar charts are sorted descending and capped at 15 rows.
+    Pie charts are guarded by _pie_safe().
+    """
+    s            = cfg["secondary"]
+    if s is None:
+        return None
+
+    x            = cfg["x"]
+    y            = cfg["y"]
+    y2           = cfg["y2"]
+    text_cols    = df.select_dtypes(exclude="number").columns.tolist()
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    lbl          = {c: c.replace("_", " ").title() for c in df.columns}
+    n            = len(df)
+
+    # ── Pie companion ─────────────────────────────────────────────────────────
+    if s == "pie":
+        if not (text_cols and numeric_cols and _pie_safe(df, x)):
+            return None
+        fig2 = go.Figure(go.Pie(
+            labels=df[x],
+            values=df[y],
+            hole=0.52,
+            marker=dict(colors=CHART_DISC, line=dict(color=BG_PAGE, width=2)),
+            textfont=dict(family="Space Grotesk", size=11, color=FONT_CLR),
+        ))
+        fig2.update_layout(**_pie_layout(CHART_DISC, BG_PAGE, FONT_CLR))
+        return fig2
+
+    # ── Scatter companion ─────────────────────────────────────────────────────
+    elif s == "scatter":
+        if len(numeric_cols) < 2:
+            return None
+        fig2 = px.scatter(
+            df,
+            x=numeric_cols[0], y=numeric_cols[1],
+            color=text_cols[0] if text_cols else None,
+            color_discrete_sequence=CHART_DISC,
+            opacity=0.80,
+            labels=lbl,
+        )
+        fig2.update_layout(**TL)
+        return fig2
+
+    # ── Horizontal bar companion ──────────────────────────────────────────────
+    elif s == "bar_h":
+        if not (text_cols and numeric_cols):
+            return None
+        _df_plot = df.sort_values(y, ascending=False).head(15)
+        _df_plot = _df_plot.sort_values(y, ascending=True)
+        fig2 = px.bar(
+            _df_plot,
+            x=y, y=x, orientation="h",
+            color=y, color_continuous_scale=CHART_SEQ,
+            labels=lbl,
+        )
+        fig2.update_traces(marker_line_width=0, marker_cornerradius=4)
+        fig2.update_layout(**TL)
+        return fig2
+
+    # ── Vertical bar companion ────────────────────────────────────────────────
+    elif s == "bar":
+        if not (text_cols and numeric_cols):
+            return None
+        _df_plot = df.sort_values(y, ascending=False).head(15)
+        fig2 = px.bar(
+            _df_plot,
+            x=x, y=y,
+            color=y, color_continuous_scale=CHART_SEQ,
+            labels=lbl,
+        )
+        fig2.update_traces(marker_line_width=0, marker_cornerradius=4)
+        fig2.update_layout(**TL)
+        return fig2
+
+    # ── Line companion ────────────────────────────────────────────────────────
+    elif s == "line":
+        if not numeric_cols:
+            return None
+        fig2 = px.line(
+            df.sort_values(x) if x in df.columns else df,
+            x=x, y=y2,
+            labels=lbl,
+            markers=True,
+            color_discrete_sequence=CHART_DISC,
+        )
+        fig2.update_traces(line_width=2.5, marker_size=6)
+        fig2.update_layout(**TL)
+        return fig2
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI HELPER FUNCTIONS — error display, guidance panel, suggestion runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_dataset_columns() -> list[str]:
+    """Return column names for the active dataset (used in error/guidance panels)."""
+    try:
+        db  = st.session_state.get("uploaded_db") or _DB_PATH
+        tbl = st.session_state.get("active_table") or "cars"
+        col_info = execute_query(f"PRAGMA table_info({tbl})", db_path=db)
+        return col_info["name"].tolist()
+    except Exception:
+        return []
+
+
+def _render_friendly_error(message: str, show_columns: bool = True) -> None:
+    """Render a styled, friendly error card with optional column list."""
+    cols_html = ""
+    if show_columns:
+        cols = _get_dataset_columns()
+        if cols:
+            chips = "".join(f'<span class="friendly-err-col">{c}</span>' for c in cols)
+            cols_html = f"""
+            <div style="margin-top:0.7rem;">
+                <div style="font-size:0.68rem;font-weight:700;text-transform:uppercase;
+                            letter-spacing:0.14em;color:#f87171;margin-bottom:0.45rem;">
+                    Available columns
+                </div>
+                <div class="friendly-err-cols">{chips}</div>
+            </div>"""
+    st.markdown(f"""
+    <div class="friendly-err">
+        <div class="friendly-err-title">⚠️ &nbsp;{message}</div>
+        <div class="friendly-err-body">
+            Try asking about the columns listed below, or rephrase your question
+            using simpler terms like <em>average</em>, <em>top 10</em>, or <em>count by category</em>.
+        </div>
+        {cols_html}
+    </div>""", unsafe_allow_html=True)
+
+
+def _render_guidance_panel() -> None:
+    """Render the 'What you can ask' guidance panel below the input."""
+    cols = _get_dataset_columns()
+    if not cols:
+        return
+    chips_html = "".join(f'<span class="guidance-col-chip">{c}</span>' for c in cols)
+
+    # Pick example questions from the current suggestions list
+    _ex = _suggestions[:5]
+    examples_html = "".join(f"<span>{q}</span>" for q in _ex)
+
+    st.markdown(f"""
+    <div class="guidance-panel">
+        <div class="guidance-title">💡 What you can ask</div>
+        <div class="guidance-cols">{chips_html}</div>
+        <div class="guidance-examples">{examples_html}</div>
+    </div>""", unsafe_allow_html=True)
+
+
+def _run_question(q: str) -> None:
+    """Store a question as pending so it auto-runs on next render cycle."""
+    st.session_state.pending_question = q
+    st.rerun()
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI BI Dashboard — Ask Questions About Your Data",
     page_icon="🚗",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ── Session defaults ──────────────────────────────────────────────────────────
 for k, v in {
-    "dark_mode":       True,
-    "result_df":       None,
-    "result_sql":      None,
-    "result_err":      None,
-    "result_insight":  None,
-    "query_history":   _load_history(),
-    "show_history":    False,
-    "uploaded_db":     None,   # path to uploaded SQLite db file
-    "active_schema":   None,   # schema string for LLM
-    "active_table":    "cars", # table name to query
-    "active_label":    None,   # display name for uploaded dataset
+    "dark_mode":           True,
+    "result_df":           None,
+    "result_sql":          None,
+    "result_err":          None,
+    "result_insight":      None,
+    "result_empty_reason": None,
+    "query_history":       _load_history(),
+    "show_history":        False,
+    "uploaded_db":         None,
+    "active_schema":       None,
+    "active_table":        "cars",
+    "active_label":        None,
+    "pending_question":    None,   # set by suggestion buttons → triggers auto-run
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -156,44 +684,51 @@ dark = st.session_state.dark_mode
 # THEME PALETTES
 # ══════════════════════════════════════════════════════════════════════════════
 if dark:
-    # ── DARK: charcoal + purple + neon green + electric blue ──────────────────
-    BG_PAGE        = "#0d0d14"
-    BG_SIDEBAR     = "#0a0a12"
-    BG_CARD        = "#13131f"
-    BG_CARD2       = "#16162a"
-    BG_INPUT       = "#0a0a12"
-    BORDER         = "#2a1f5c"
-    BORDER_FOCUS   = "#7c3aed"
-    TEXT_H         = "#f0eeff"
-    TEXT_BODY      = "#b0a8d8"
-    TEXT_MUTED     = "#4a3d7a"
-    # accent gradients
+    # ── DARK: premium multi-surface AI analytics design system ────────────────
+    # Five distinct dark tones create real depth between layers
+    BG_PAGE        = "#0a0a0f"   # deepest — page background
+    BG_SIDEBAR     = "#0c0c14"   # sidebar surface
+    BG_CARD        = "#1a1a26"   # card surface — noticeably lighter than page
+    BG_CARD2       = "#141420"   # slightly deeper card variant
+    BG_INPUT       = "#0f0f18"   # input fields — between page and card
+    BG_PANEL       = "#12121a"   # section panels
+    BORDER         = "#26263a"   # subtle structural border
+    BORDER_FOCUS   = "#7c3aed"   # purple focus/active state
+    BORDER_SUBTLE  = "#1e1e2e"   # barely-visible inner borders
+    TEXT_H         = "#f0eeff"   # headings — near white with cool tint
+    TEXT_BODY      = "#a8a0cc"   # body — softer lavender gray
+    TEXT_MUTED     = "#4a4468"   # muted — dimmed labels
+    # Accent gradients — purple → green → blue
     GRAD_ACCENT    = "90deg,#7c3aed,#00f5a0,#00d4ff"
-    GRAD_BTN       = "135deg,#7c3aed 0%,#00c9a7 100%"
-    GRAD_BTN_H     = "135deg,#6d28d9 0%,#00a37d 100%"
-    GRAD_HERO      = "135deg,#0d0d14 0%,#1a0a3a 50%,#0d1a14 100%"
-    GRAD_CARD      = "135deg,#13131f,#1a1230"
-    GLOW_BTN       = "rgba(124,58,237,0.55)"
-    GLOW_INPUT     = "rgba(124,58,237,0.25)"
-    GLOW_CARD      = "rgba(124,58,237,0.12)"
-    GLOW_GREEN     = "rgba(0,245,160,0.15)"
-    SHADOW         = "0 8px 40px rgba(0,0,0,0.6)"
-    # chart colors
-    CHART_SEQ      = [[0,"#1a0a3a"],[0.5,"#7c3aed"],[1,"#00f5a0"]]
+    GRAD_BTN       = "135deg,#7c3aed 0%,#5b21b6 50%,#4c1d95 100%"
+    GRAD_BTN_H     = "135deg,#8b5cf6 0%,#7c3aed 100%"
+    GRAD_HERO      = "135deg,#0a0a0f 0%,#110820 40%,#080f18 100%"
+    GRAD_CARD      = "135deg,#1a1a26 0%,#141420 100%"
+    GRAD_KPI       = "135deg,#1e1e2e 0%,#1a1a26 100%"
+    # Glow — used only on interactive elements and hover states
+    GLOW_BTN       = "rgba(124,58,237,0.45)"
+    GLOW_INPUT     = "rgba(124,58,237,0.20)"
+    GLOW_CARD      = "rgba(124,58,237,0.15)"
+    GLOW_GREEN     = "rgba(0,245,160,0.10)"
+    GLOW_BLUE      = "rgba(0,212,255,0.10)"
+    SHADOW         = "0 4px 24px rgba(0,0,0,0.5), 0 1px 0 rgba(255,255,255,0.03)"
+    SHADOW_DEEP    = "0 8px 40px rgba(0,0,0,0.7), 0 1px 0 rgba(255,255,255,0.04)"
+    # Chart
+    CHART_SEQ      = [[0,"#1a0a3a"],[0.4,"#7c3aed"],[0.7,"#00d4ff"],[1,"#00f5a0"]]
     CHART_DISC     = ["#7c3aed","#00f5a0","#00d4ff","#f472b6","#fb923c","#facc15"]
-    PLOT_BG        = "#0d0d14"
+    PLOT_BG        = "#0a0a0f"
     GRID_CLR       = "#1a1a2e"
-    FONT_CLR       = "#4a3d7a"
+    FONT_CLR       = "#4a4468"
     KPI_COLORS     = [
-        ("135deg,#7c3aed,#a855f7","rgba(124,58,237,0.3)"),
-        ("135deg,#00c9a7,#00f5a0","rgba(0,201,167,0.3)"),
-        ("135deg,#0ea5e9,#00d4ff","rgba(14,165,233,0.3)"),
-        ("135deg,#f472b6,#fb7185","rgba(244,114,182,0.3)"),
+        ("135deg,#7c3aed,#a855f7","rgba(124,58,237,0.25)"),
+        ("135deg,#00b894,#00f5a0","rgba(0,184,148,0.25)"),
+        ("135deg,#0284c7,#00d4ff","rgba(2,132,199,0.25)"),
+        ("135deg,#db2777,#f472b6","rgba(219,39,119,0.25)"),
     ]
-    SCROLLBAR_TH   = "#7c3aed66"
+    SCROLLBAR_TH   = "#26263a"
     SCROLLBAR_TH_H = "#7c3aed"
-    ERR_BG         = "#1a0a0a"; ERR_BORDER = "#5c1a1a"; ERR_TEXT = "#f87171"
-    WARN_BG        = "#1a1400"; WARN_BORDER= "#5c4200"; WARN_TEXT= "#fbbf24"
+    ERR_BG         = "#130a0a"; ERR_BORDER = "#3d1515"; ERR_TEXT = "#f87171"
+    WARN_BG        = "#110e00"; WARN_BORDER= "#3d3000"; WARN_TEXT= "#fbbf24"
     EXPANDER_ICON  = "#7c3aed"
     CODE_COLOR     = "#00f5a0"
     TOGGLE_LABEL   = "☀️ Switch to Light Mode"
@@ -244,7 +779,9 @@ else:
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown(f"""
 <style>
-/* Force sidebar always expanded (override Streamlit collapsed state) */
+/* ═══════════════════════════════════════════════════════════════════════════
+   SIDEBAR — forced always visible
+   ═══════════════════════════════════════════════════════════════════════════ */
 section[data-testid="stSidebar"] {{
     display: block !important;
     visibility: visible !important;
@@ -257,16 +794,16 @@ section[data-testid="stSidebar"] > div:first-child {{
     margin-left: 0 !important;
     transform: none !important;
 }}
-/* When Streamlit marks sidebar collapsed, force it visible anyway */
 section[data-testid="stSidebar"][aria-expanded="false"],
 section[data-testid="stSidebar"][aria-expanded="false"] > div:first-child {{
-    width: 300px !important;
-    min-width: 300px !important;
-    margin-left: 0 !important;
-    transform: none !important;
+    width: 300px !important; min-width: 300px !important;
+    margin-left: 0 !important; transform: none !important;
     visibility: visible !important;
 }}
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   FONTS & BASE RESET
+   ═══════════════════════════════════════════════════════════════════════════ */
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
 
 *, html, body, [class*="css"] {{
@@ -274,11 +811,13 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div:first-child {{
     box-sizing: border-box;
 }}
 
-/* ── Base ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   BASE — layered surfaces
+   ═══════════════════════════════════════════════════════════════════════════ */
 .stApp {{ background: {BG_PAGE} !important; color: {TEXT_BODY} !important; }}
 .block-container {{ padding: 0 2.5rem 3rem 2.5rem !important; max-width: 1500px !important; }}
 footer {{ visibility: hidden !important; }}
-/* Top header/toolbar — light in light mode, visible text */
+
 header,
 header[data-testid="stHeader"],
 .stApp header,
@@ -287,47 +826,36 @@ header[data-testid="stHeader"],
     background: {BG_SIDEBAR} !important;
     border-bottom: 1px solid {BORDER} !important;
 }}
-header *,
-header[data-testid="stHeader"] *,
-.stApp header *,
-[data-testid="stHeader"] * {{
+header *, header[data-testid="stHeader"] *, .stApp header *, [data-testid="stHeader"] * {{
     color: {TEXT_BODY} !important;
 }}
-/* Deploy / toolbar buttons in header stay visible */
-header a,
-header button {{
-    color: {TEXT_H} !important;
-}}
-/* Keep toolbar (Running/Stop, Deploy) permanently visible */
-header,
-header *,
-#MainMenu,
-#MainMenu *,
-[data-testid="stHeader"],
-[data-testid="stHeader"] * {{
-    visibility: visible !important;
-}}
-/* Don't hide 'header' — it can contain the sidebar expand/collapse control */
+header a, header button {{ color: {TEXT_H} !important; }}
+header, header *, #MainMenu, #MainMenu *,
+[data-testid="stHeader"], [data-testid="stHeader"] * {{ visibility: visible !important; }}
 
-/* ── Scrollbar ── */
-::-webkit-scrollbar {{ width:5px; height:5px; }}
-::-webkit-scrollbar-track {{ background:{BG_PAGE}; }}
-::-webkit-scrollbar-thumb {{ background:{SCROLLBAR_TH}; border-radius:10px; }}
-::-webkit-scrollbar-thumb:hover {{ background:{SCROLLBAR_TH_H}; }}
+/* ═══════════════════════════════════════════════════════════════════════════
+   SCROLLBAR
+   ═══════════════════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar {{ width: 4px; height: 4px; }}
+::-webkit-scrollbar-track {{ background: {BG_PAGE}; }}
+::-webkit-scrollbar-thumb {{
+    background: {SCROLLBAR_TH};
+    border-radius: 10px;
+    transition: background 0.2s;
+}}
+::-webkit-scrollbar-thumb:hover {{ background: {SCROLLBAR_TH_H}; }}
 
-/* ── Sidebar ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   SIDEBAR SURFACE
+   ═══════════════════════════════════════════════════════════════════════════ */
 section[data-testid="stSidebar"] {{
     background: {BG_SIDEBAR} !important;
     border-right: 1px solid {BORDER} !important;
 }}
 section[data-testid="stSidebar"] * {{ color: {TEXT_BODY} !important; }}
-/* Hide sidebar collapse button (arrow) at top — sidebar is forced open */
 section[data-testid="stSidebar"] button[aria-label*="ollapse"],
 section[data-testid="stSidebar"] button[aria-label*="idebar"],
-section[data-testid="stSidebar"] > div > button:first-of-type {{
-    display: none !important;
-}}
-/* Hide sidebar resize handle (no double-arrow cursor/tooltip on hover) */
+section[data-testid="stSidebar"] > div > button:first-of-type {{ display: none !important; }}
 [data-testid="stSidebarResizeHandle"],
 section[data-testid="stSidebar"] [role="separator"],
 section[data-testid="stSidebar"] > div > [role="separator"],
@@ -335,500 +863,629 @@ section[data-testid="stSidebar"] div[style*="cursor"][style*="resize"] {{
     display: none !important;
     pointer-events: none !important;
 }}
-/* Hide icon-name text that can appear next to the sidebar (e.g. double_arrow_right) */
-[data-testid="stSidebarResizeHandle"],
-[data-testid="stSidebarResizeHandle"] * {{
-    font-size: 0 !important;
-    line-height: 0 !important;
-    visibility: hidden !important;
+[data-testid="stSidebarResizeHandle"], [data-testid="stSidebarResizeHandle"] * {{
+    font-size: 0 !important; line-height: 0 !important; visibility: hidden !important;
 }}
-/* Hide sidebar collapse/expand button in main area (and icon name text) */
 button[aria-label*="ollapse"], button[aria-label*="idebar"], button[aria-label*="xpand"],
 [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"] {{
     display: none !important;
 }}
 
-/* ── Animated top bar ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   ANIMATIONS
+   ═══════════════════════════════════════════════════════════════════════════ */
 @keyframes shimmer {{
     0%   {{ background-position: -200% center; }}
     100% {{ background-position:  200% center; }}
 }}
+@keyframes heroIn {{
+    from {{ opacity: 0; transform: translateY(-18px); }}
+    to   {{ opacity: 1; transform: translateY(0); }}
+}}
+@keyframes cardIn {{
+    from {{ opacity: 0; transform: translateY(14px) scale(0.97); }}
+    to   {{ opacity: 1; transform: translateY(0) scale(1); }}
+}}
+@keyframes fadeUp {{
+    from {{ opacity: 0; transform: translateY(8px); }}
+    to   {{ opacity: 1; transform: translateY(0); }}
+}}
+@keyframes pulseGlow {{
+    0%, 100% {{ box-shadow: 0 0 0 0 {GLOW_BTN}; }}
+    50%       {{ box-shadow: 0 0 24px 4px {GLOW_BTN}; }}
+}}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ANIMATED TOP BAR
+   ═══════════════════════════════════════════════════════════════════════════ */
 .top-bar {{
-    height: 3px;
+    height: 2px;
     background: linear-gradient({GRAD_ACCENT});
     background-size: 200% auto;
-    animation: shimmer 3s linear infinite;
+    animation: shimmer 4s linear infinite;
     margin-bottom: 0;
 }}
 
-/* ── Hero section ── */
-@keyframes heroIn {{
-    from {{ opacity:0; transform:translateY(-20px); }}
-    to   {{ opacity:1; transform:translateY(0); }}
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   HERO SECTION
+   ═══════════════════════════════════════════════════════════════════════════ */
 .hero {{
     background: linear-gradient({GRAD_HERO});
     border-bottom: 1px solid {BORDER};
-    padding: 3rem 3rem 2.5rem 3rem;
+    padding: 3.2rem 3rem 2.8rem 3rem;
     margin: 0 -2.5rem 2.5rem -2.5rem;
     position: relative;
     overflow: hidden;
     animation: heroIn 0.7s cubic-bezier(.4,0,.2,1) both;
 }}
 .hero::before {{
-    content:'';
-    position:absolute; top:-100px; right:-100px;
-    width:350px; height:350px;
-    background: radial-gradient(circle, {GLOW_BTN} 0%, transparent 65%);
-    border-radius:50%; pointer-events:none;
+    content: '';
+    position: absolute; top: -80px; right: -80px;
+    width: 400px; height: 400px;
+    background: radial-gradient(circle, rgba(124,58,237,0.18) 0%, transparent 60%);
+    border-radius: 50%; pointer-events: none;
 }}
 .hero::after {{
-    content:'';
-    position:absolute; bottom:-80px; left:20%;
-    width:250px; height:250px;
-    background: radial-gradient(circle, {GLOW_GREEN} 0%, transparent 65%);
-    border-radius:50%; pointer-events:none;
+    content: '';
+    position: absolute; bottom: -60px; left: 15%;
+    width: 300px; height: 300px;
+    background: radial-gradient(circle, rgba(0,245,160,0.08) 0%, transparent 60%);
+    border-radius: 50%; pointer-events: none;
 }}
 .hero-eyebrow {{
-    font-size:0.65rem; font-weight:700; letter-spacing:0.22em;
-    text-transform:uppercase; color:{TEXT_MUTED};
-    margin-bottom:0.7rem;
+    font-size: 0.62rem; font-weight: 700; letter-spacing: 0.24em;
+    text-transform: uppercase; color: {TEXT_MUTED};
+    margin-bottom: 0.8rem;
+    display: flex; align-items: center; gap: 0.5rem;
+}}
+.hero-eyebrow::before {{
+    content: '';
+    width: 18px; height: 2px;
+    background: linear-gradient(90deg, #7c3aed, #00f5a0);
+    border-radius: 2px;
+    display: inline-block;
 }}
 .hero h1 {{
-    font-size:2.5rem; font-weight:700; letter-spacing:-0.04em;
-    line-height:1.1; color:{TEXT_H}; margin:0 0 0.6rem 0;
+    font-size: 2.8rem; font-weight: 700; letter-spacing: -0.04em;
+    line-height: 1.08; color: {TEXT_H}; margin: 0 0 0.7rem 0;
 }}
 .hero h1 em {{
-    font-style:normal;
+    font-style: normal;
     background: linear-gradient({GRAD_ACCENT});
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-    background-clip:text; background-size:200% auto;
-    animation: shimmer 4s linear infinite;
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; background-size: 200% auto;
+    animation: shimmer 5s linear infinite;
 }}
 .hero-sub {{
-    font-size:0.95rem; color:{TEXT_MUTED}; font-weight:400;
-    max-width:600px; line-height:1.6;
+    font-size: 0.95rem; color: {TEXT_MUTED}; font-weight: 400;
+    max-width: 560px; line-height: 1.65;
 }}
 
-/* ── Hero input wrapper ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   HERO INPUT
+   ═══════════════════════════════════════════════════════════════════════════ */
 .hero-input-wrap {{
-    position: relative;
-    margin-top: 2rem;
-    max-width: 860px;
+    position: relative; margin-top: 2.2rem; max-width: 860px;
 }}
 .hero-input-wrap::before {{
-    content:'';
-    position:absolute; inset:-2px;
+    content: '';
+    position: absolute; inset: -1.5px;
     background: linear-gradient({GRAD_ACCENT});
     background-size: 200% auto;
-    animation: shimmer 3s linear infinite;
-    border-radius:18px;
-    z-index:0;
-    opacity:0.85;
+    animation: shimmer 4s linear infinite;
+    border-radius: 18px; z-index: 0; opacity: 0.7;
 }}
 .hero-input-inner {{
-    position:relative; z-index:1;
-    background:{BG_INPUT};
-    border-radius:16px;
-    padding:2px;
+    position: relative; z-index: 1;
+    background: {BG_INPUT}; border-radius: 16px; padding: 2px;
 }}
 .stTextArea textarea {{
     background: {BG_INPUT} !important;
-    border: none !important;
-    border-radius: 14px !important;
+    border: none !important; border-radius: 14px !important;
     color: {TEXT_H} !important;
     font-family: 'Space Grotesk', sans-serif !important;
-    font-size: 1.05rem !important;
-    font-weight: 400 !important;
-    line-height: 1.6 !important;
-    padding: 1.1rem 1.4rem !important;
-    transition: box-shadow 0.25s ease !important;
-    resize: none !important;
-    caret-color: {BORDER_FOCUS} !important;
+    font-size: 1.05rem !important; font-weight: 400 !important;
+    line-height: 1.6 !important; padding: 1.1rem 1.4rem !important;
+    transition: box-shadow 0.3s ease !important;
+    resize: none !important; caret-color: {BORDER_FOCUS} !important;
 }}
 .stTextArea textarea:focus {{
-    box-shadow: 0 0 0 0px transparent !important;
+    box-shadow: inset 0 0 0 1px rgba(124,58,237,0.4) !important;
     outline: none !important;
 }}
-.stTextArea textarea::placeholder {{ color:{TEXT_MUTED} !important; opacity:1 !important; }}
-.stTextArea label {{ display:none !important; }}
-[data-testid="stTextAreaResizeHandle"] {{ display:none !important; }}
+.stTextArea textarea::placeholder {{ color: {TEXT_MUTED} !important; opacity: 1 !important; }}
+.stTextArea label {{ display: none !important; }}
+[data-testid="stTextAreaResizeHandle"] {{ display: none !important; }}
 
-/* ── Buttons ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   BUTTONS
+   ═══════════════════════════════════════════════════════════════════════════ */
 .stButton > button {{
     background: linear-gradient({GRAD_BTN}) !important;
-    color:#ffffff !important;
-    border:none !important;
-    border-radius:12px !important;
-    font-family:'Space Grotesk',sans-serif !important;
-    font-size:0.9rem !important;
-    font-weight:700 !important;
-    letter-spacing:0.04em !important;
-    padding:0.65rem 2rem !important;
-    transition: all 0.22s cubic-bezier(.4,0,.2,1) !important;
-    box-shadow: 0 4px 20px {GLOW_BTN} !important;
+    color: #ffffff !important; border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 0.88rem !important; font-weight: 700 !important;
+    letter-spacing: 0.05em !important; padding: 0.65rem 2rem !important;
+    transition: all 0.25s cubic-bezier(.4,0,.2,1) !important;
+    box-shadow: 0 2px 12px {GLOW_BTN}, inset 0 1px 0 rgba(255,255,255,0.1) !important;
 }}
 .stButton > button:hover {{
     background: linear-gradient({GRAD_BTN_H}) !important;
-    transform: translateY(-2px) scale(1.02) !important;
-    box-shadow: 0 8px 32px {GLOW_BTN} !important;
+    transform: translateY(-2px) scale(1.01) !important;
+    box-shadow: 0 6px 28px {GLOW_BTN}, inset 0 1px 0 rgba(255,255,255,0.15) !important;
 }}
-.stButton > button:active {{ transform:translateY(0) scale(0.99) !important; }}
+.stButton > button:active {{ transform: translateY(0) scale(0.99) !important; }}
 
-
-
-
-
-/* ── Dataset Intelligence section ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   DATASET INTELLIGENCE PANEL
+   ═══════════════════════════════════════════════════════════════════════════ */
 .di-section {{
-    background: linear-gradient({GRAD_CARD});
+    background: {BG_PANEL};
     border: 1px solid {BORDER};
-    border-radius: 20px;
-    padding: 2rem 2.2rem;
-    margin-bottom: 2rem;
-    position: relative;
-    overflow: hidden;
+    border-top: 2px solid #7c3aed;
+    border-radius: 16px; padding: 1.8rem 2rem; margin-bottom: 2rem;
+    position: relative; overflow: hidden;
     box-shadow: {SHADOW};
     animation: fadeUp 0.5s ease both;
+    backdrop-filter: blur(8px);
 }}
-.di-section::before {{
-    content:'';
-    position:absolute; bottom:-60px; right:-60px;
-    width:200px; height:200px;
+.di-section::after {{
+    content: '';
+    position: absolute; bottom: -50px; right: -50px;
+    width: 180px; height: 180px;
     background: radial-gradient(circle, {GLOW_GREEN} 0%, transparent 70%);
-    border-radius:50%; pointer-events:none;
+    border-radius: 50%; pointer-events: none;
 }}
 .di-header {{
-    display: flex;
-    align-items: center;
-    gap: 0.8rem;
-    margin-bottom: 1.4rem;
+    display: flex; align-items: center; gap: 0.8rem; margin-bottom: 1.4rem;
 }}
 .di-header-icon {{
-    width: 36px; height: 36px; border-radius: 10px;
+    width: 34px; height: 34px; border-radius: 8px;
     background: linear-gradient({GRAD_BTN});
     display: flex; align-items: center; justify-content: center;
-    font-size: 1rem;
-    box-shadow: 0 2px 10px {GLOW_BTN};
-    flex-shrink: 0;
+    font-size: 0.95rem; box-shadow: 0 2px 8px {GLOW_BTN}; flex-shrink: 0;
 }}
-.di-header-text {{
-    font-family: 'Space Grotesk', sans-serif;
-    font-size: 1rem;
-    font-weight: 700;
-    color: {TEXT_H};
-    letter-spacing: -0.01em;
-}}
-.di-header-sub {{
-    font-size: 0.72rem;
-    color: {TEXT_MUTED};
-    font-weight: 400;
-    margin-top: 0.1rem;
-}}
+.di-header-text {{ font-size: 0.95rem; font-weight: 700; color: {TEXT_H}; letter-spacing: -0.01em; }}
+.di-header-sub {{ font-size: 0.7rem; color: {TEXT_MUTED}; font-weight: 400; margin-top: 0.1rem; }}
 .di-summary {{
     background: {BG_INPUT};
-    border: 1px solid {BORDER};
+    border: 1px solid {BORDER_SUBTLE};
     border-left: 3px solid {BORDER_FOCUS};
-    border-radius: 10px;
-    padding: 1rem 1.3rem;
-    font-size: 0.92rem;
-    color: {TEXT_BODY};
-    line-height: 1.7;
-    margin-top: 1.4rem;
-    font-style: italic;
+    border-radius: 10px; padding: 1rem 1.3rem;
+    font-size: 0.91rem; color: {TEXT_BODY}; line-height: 1.7; margin-top: 1.4rem; font-style: italic;
 }}
 .di-summary-label {{
-    font-size: 0.62rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    color: {BORDER_FOCUS};
-    margin-bottom: 0.4rem;
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
+    font-size: 0.6rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: {BORDER_FOCUS}; margin-bottom: 0.4rem;
+    display: flex; align-items: center; gap: 0.4rem;
 }}
 
-/* ── KPI cards ── */
-@keyframes cardIn {{
-    from {{ opacity:0; transform:translateY(16px) scale(0.97); }}
-    to   {{ opacity:1; transform:translateY(0) scale(1); }}
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   KPI CARDS
+   ═══════════════════════════════════════════════════════════════════════════ */
 .kpi-card {{
-    background: linear-gradient({GRAD_CARD});
-    border:1px solid {BORDER};
-    border-radius:18px;
-    padding:1.6rem 1.8rem;
-    position:relative; overflow:hidden;
+    background: linear-gradient({GRAD_KPI});
+    border: 1px solid {BORDER}; border-radius: 16px;
+    padding: 1.5rem 1.6rem; position: relative; overflow: hidden;
     box-shadow: {SHADOW};
-    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    transition: transform 0.25s cubic-bezier(.4,0,.2,1),
+                box-shadow 0.25s cubic-bezier(.4,0,.2,1),
+                border-color 0.25s ease;
     animation: cardIn 0.5s cubic-bezier(.4,0,.2,1) both;
-    cursor:default;
+    cursor: default; backdrop-filter: blur(4px);
 }}
 .kpi-card:hover {{
-    transform:translateY(-4px);
-    box-shadow: {SHADOW}, 0 0 30px {GLOW_CARD};
-    border-color:{BORDER_FOCUS};
+    transform: translateY(-5px);
+    box-shadow: {SHADOW_DEEP}, 0 0 32px {GLOW_CARD};
+    border-color: {BORDER_FOCUS};
 }}
 .kpi-orb {{
-    position:absolute; top:-35px; right:-35px;
-    width:110px; height:110px;
-    border-radius:50%; pointer-events:none; opacity:0.5;
+    position: absolute; top: -40px; right: -40px;
+    width: 120px; height: 120px; border-radius: 50%; pointer-events: none; opacity: 0.4;
 }}
-.kpi-icon {{ font-size:1.6rem; margin-bottom:0.8rem; display:block; }}
+.kpi-icon {{ font-size: 1.5rem; margin-bottom: 0.75rem; display: block; }}
 .kpi-label {{
-    font-size:0.65rem; font-weight:700; text-transform:uppercase;
-    letter-spacing:0.16em; color:{TEXT_MUTED}; margin-bottom:0.4rem;
+    font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: {TEXT_MUTED}; margin-bottom: 0.35rem;
 }}
-.kpi-value {{
-    font-size:2.2rem; font-weight:700; letter-spacing:-0.04em;
-    color:{TEXT_H}; line-height:1;
-}}
-.kpi-sub {{
-    font-size:0.72rem; font-weight:500;
-    margin-top:0.45rem; color:{TEXT_MUTED};
-}}
-.kpi-bar {{
-    position:absolute; bottom:0; left:0; right:0;
-    height:3px; border-radius:0 0 18px 18px;
-}}
+.kpi-value {{ font-size: 2.1rem; font-weight: 700; letter-spacing: -0.04em; color: {TEXT_H}; line-height: 1; }}
+.kpi-sub {{ font-size: 0.7rem; font-weight: 500; margin-top: 0.4rem; color: {TEXT_MUTED}; }}
+.kpi-bar {{ position: absolute; bottom: 0; left: 0; right: 0; height: 2px; border-radius: 0 0 16px 16px; }}
 
-/* ── Section titles ── */
-@keyframes fadeUp {{
-    from {{ opacity:0; transform:translateY(10px); }}
-    to   {{ opacity:1; transform:translateY(0); }}
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION HEADERS
+   ═══════════════════════════════════════════════════════════════════════════ */
 .section-hd {{
-    display:flex; align-items:center; gap:0.7rem;
-    margin:2.2rem 0 1rem 0;
-    animation: fadeUp 0.4s ease both;
+    display: flex; align-items: center; gap: 0.7rem;
+    margin: 2.4rem 0 1rem 0; animation: fadeUp 0.4s ease both;
 }}
 .section-hd-line {{
-    flex:1; height:1px;
+    flex: 1; height: 1px;
     background: linear-gradient(90deg, {BORDER}, transparent);
 }}
 .section-hd-text {{
-    font-size:0.68rem; font-weight:700; text-transform:uppercase;
-    letter-spacing:0.18em; color:{TEXT_MUTED}; white-space:nowrap;
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.2em; color: {TEXT_MUTED}; white-space: nowrap;
 }}
 
-/* ── Query history ── */
-.hist-wrap {{
-    animation: fadeUp 0.4s ease both;
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   QUERY HISTORY CARDS
+   ═══════════════════════════════════════════════════════════════════════════ */
+.hist-wrap {{ animation: fadeUp 0.4s ease both; }}
 .hist-card {{
-    background: linear-gradient({GRAD_CARD});
-    border: 1px solid {BORDER};
-    border-radius: 16px;
-    padding: 1.4rem 1.6rem;
-    margin-bottom: 1rem;
-    box-shadow: {SHADOW};
-    position: relative;
-    overflow: hidden;
-    transition: border-color 0.2s ease;
+    background: {BG_PANEL};
+    border: 1px solid {BORDER}; border-radius: 14px;
+    padding: 1.3rem 1.5rem; margin-bottom: 0.9rem;
+    box-shadow: {SHADOW}; position: relative; overflow: hidden;
+    transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
 }}
-.hist-card:hover {{ border-color: {BORDER_FOCUS}; }}
+.hist-card:hover {{
+    border-color: {BORDER_FOCUS}; transform: translateY(-2px);
+    box-shadow: {SHADOW}, 0 0 20px rgba(124,58,237,0.10);
+}}
 .hist-card-header {{
     display: flex; align-items: flex-start;
-    justify-content: space-between; gap: 1rem;
-    margin-bottom: 0.8rem;
+    justify-content: space-between; gap: 1rem; margin-bottom: 0.8rem;
 }}
-.hist-question {{
-    font-size: 0.95rem; font-weight: 600;
-    color: {TEXT_H}; line-height: 1.4; flex: 1;
-}}
+.hist-question {{ font-size: 0.92rem; font-weight: 600; color: {TEXT_H}; line-height: 1.4; flex: 1; }}
 .hist-badge {{
-    font-size: 0.62rem; font-weight: 700;
+    font-size: 0.6rem; font-weight: 700;
     text-transform: uppercase; letter-spacing: 0.14em;
-    background: {BORDER_FOCUS}22; color: {BORDER_FOCUS};
-    border: 1px solid {BORDER_FOCUS}44;
-    border-radius: 20px; padding: 0.18rem 0.65rem;
-    white-space: nowrap; flex-shrink: 0;
+    background: rgba(124,58,237,0.12); color: #a78bfa;
+    border: 1px solid rgba(124,58,237,0.25);
+    border-radius: 20px; padding: 0.16rem 0.6rem; white-space: nowrap; flex-shrink: 0;
 }}
 .hist-insight {{
-    font-size: 0.84rem; color: {TEXT_BODY};
-    line-height: 1.65; font-style: italic;
-    border-left: 3px solid {BORDER_FOCUS}66;
-    padding-left: 0.85rem; margin-top: 0.3rem;
+    font-size: 0.82rem; color: {TEXT_BODY}; line-height: 1.65; font-style: italic;
+    border-left: 2px solid rgba(124,58,237,0.4); padding-left: 0.85rem; margin-top: 0.3rem;
 }}
-.hist-num {{
-    font-size: 0.68rem; color: {TEXT_MUTED};
-    margin-top: 0.7rem; font-weight: 500;
-}}
+.hist-num {{ font-size: 0.66rem; color: {TEXT_MUTED}; margin-top: 0.65rem; font-weight: 500; }}
 
-/* ── AI Insight card ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   AI INSIGHT CARD
+   ═══════════════════════════════════════════════════════════════════════════ */
 .insight-card {{
-    background: linear-gradient(135deg, {BG_CARD2}, {BG_CARD});
+    background: linear-gradient(135deg, {BG_CARD} 0%, {BG_CARD2} 100%);
     border: 1px solid {BORDER};
-    border-left: 4px solid {BORDER_FOCUS};
-    border-radius: 16px;
-    padding: 1.5rem 1.8rem;
-    margin-bottom: 0.5rem;
-    box-shadow: {SHADOW}, 0 0 30px {GLOW_CARD};
-    position: relative;
-    overflow: hidden;
+    border-left: 3px solid #7c3aed;
+    border-radius: 14px; padding: 1.5rem 1.8rem; margin-bottom: 0.5rem;
+    box-shadow: {SHADOW}, 0 0 40px rgba(124,58,237,0.10);
+    position: relative; overflow: hidden;
     animation: fadeUp 0.5s cubic-bezier(.4,0,.2,1) both;
 }}
 .insight-card::before {{
     content: '';
-    position: absolute; top: -40px; right: -40px;
-    width: 130px; height: 130px;
-    background: radial-gradient(circle, {GLOW_BTN} 0%, transparent 70%);
+    position: absolute; top: -30px; right: -30px;
+    width: 120px; height: 120px;
+    background: radial-gradient(circle, rgba(124,58,237,0.12) 0%, transparent 70%);
     border-radius: 50%; pointer-events: none;
 }}
-.insight-avatar {{
-    display: flex; align-items: center; gap: 0.6rem;
-    margin-bottom: 0.9rem;
-}}
+.insight-avatar {{ display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.85rem; }}
 .insight-avatar-icon {{
-    width: 32px; height: 32px; border-radius: 50%;
+    width: 30px; height: 30px; border-radius: 50%;
     background: linear-gradient({GRAD_BTN});
     display: flex; align-items: center; justify-content: center;
-    font-size: 0.9rem; flex-shrink: 0;
-    box-shadow: 0 2px 10px {GLOW_BTN};
+    font-size: 0.85rem; flex-shrink: 0; box-shadow: 0 2px 8px {GLOW_BTN};
 }}
 .insight-avatar-label {{
-    font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.16em; color: {BORDER_FOCUS};
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: #a78bfa;
 }}
-.insight-text {{
-    font-size: 0.97rem; line-height: 1.75;
-    color: {TEXT_BODY}; font-weight: 400;
-}}
+.insight-text {{ font-size: 0.95rem; line-height: 1.78; color: {TEXT_BODY}; font-weight: 400; }}
 
-/* ── Results fade-in ── */
-.results-wrap {{
-    animation: fadeUp 0.5s cubic-bezier(.4,0,.2,1) both;
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   RESULTS AREA
+   ═══════════════════════════════════════════════════════════════════════════ */
+.results-wrap {{ animation: fadeUp 0.5s cubic-bezier(.4,0,.2,1) both; }}
 
-/* ── Expander ── */
-/* Hide the raw "_arrow_" text Streamlit injects into expander labels */
-.stExpander > details > summary > span:first-child {{
-    display: none !important;
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   EXPANDER
+   ═══════════════════════════════════════════════════════════════════════════ */
+.stExpander > details > summary > span:first-child {{ display: none !important; }}
 .stExpander > details > summary p {{
-    color: {TEXT_BODY} !important;
-    font-size: 0.88rem !important;
-    font-weight: 600 !important;
+    color: {TEXT_BODY} !important; font-size: 0.86rem !important; font-weight: 600 !important;
 }}
 .stExpander {{
-    background:{BG_CARD} !important;
-    border:1px solid {BORDER} !important;
-    border-radius:14px !important;
-    box-shadow:{SHADOW} !important;
-    overflow:hidden !important;
+    background: {BG_PANEL} !important; border: 1px solid {BORDER} !important;
+    border-radius: 12px !important; box-shadow: {SHADOW} !important; overflow: hidden !important;
 }}
 .stExpander > details > summary {{
-    color:{TEXT_MUTED} !important;
-    font-size:0.82rem !important; font-weight:600 !important;
-    padding:0.85rem 1.1rem !important;
+    color: {TEXT_MUTED} !important; font-size: 0.82rem !important;
+    font-weight: 600 !important; padding: 0.8rem 1rem !important;
+    transition: color 0.2s ease !important;
 }}
-.stExpander > details > summary:hover {{ color:{EXPANDER_ICON} !important; }}
-.stExpander > details > summary svg {{ fill:{EXPANDER_ICON} !important; }}
+.stExpander > details > summary:hover {{ color: {EXPANDER_ICON} !important; }}
+.stExpander > details > summary svg {{ fill: {EXPANDER_ICON} !important; }}
 pre, code {{
-    font-family:'Fira Code',monospace !important;
-    font-size:0.78rem !important;
-    background:{BG_INPUT} !important;
-    color:{CODE_COLOR} !important;
-    border-radius:10px !important;
-    border:none !important;
+    font-family: 'Fira Code', monospace !important; font-size: 0.78rem !important;
+    background: {BG_INPUT} !important; color: {CODE_COLOR} !important;
+    border-radius: 8px !important; border: none !important;
+    border-left: 2px solid rgba(0,245,160,0.3) !important;
 }}
 
-/* ── Dataframe ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   DATAFRAME
+   ═══════════════════════════════════════════════════════════════════════════ */
 [data-testid="stDataFrame"] {{
-    border:1px solid {BORDER} !important;
-    border-radius:14px !important;
-    overflow:hidden !important;
-    box-shadow:{SHADOW} !important;
+    border: 1px solid {BORDER} !important; border-radius: 12px !important;
+    overflow: hidden !important; box-shadow: {SHADOW} !important;
     animation: fadeUp 0.45s ease both;
 }}
 
-/* ── Error / warn boxes ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   ERROR & WARNING BOXES
+   ═══════════════════════════════════════════════════════════════════════════ */
 .err-box {{
-    background:{ERR_BG}; border:1px solid {ERR_BORDER};
-    border-left:4px solid #ef4444; border-radius:12px;
-    padding:1rem 1.3rem; color:{ERR_TEXT};
-    font-size:0.87rem; font-weight:500;
+    background: {ERR_BG}; border: 1px solid {ERR_BORDER};
+    border-left: 3px solid #ef4444; border-radius: 10px;
+    padding: 1rem 1.3rem; color: {ERR_TEXT}; font-size: 0.87rem; font-weight: 500;
     animation: fadeUp 0.3s ease;
 }}
 .warn-box {{
-    background:{WARN_BG}; border:1px solid {WARN_BORDER};
-    border-left:4px solid #f59e0b; border-radius:12px;
-    padding:1rem 1.3rem; color:{WARN_TEXT};
-    font-size:0.87rem; font-weight:500;
+    background: {WARN_BG}; border: 1px solid {WARN_BORDER};
+    border-left: 3px solid #f59e0b; border-radius: 10px;
+    padding: 1rem 1.3rem; color: {WARN_TEXT}; font-size: 0.87rem; font-weight: 500;
     animation: fadeUp 0.3s ease;
 }}
 
-/* ── Sidebar ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   SIDEBAR CONTENT
+   ═══════════════════════════════════════════════════════════════════════════ */
 .sb-brand {{
-    text-align:center; padding:1.5rem 0 1.8rem 0;
-    border-bottom:1px solid {BORDER}; margin-bottom:1.2rem;
+    text-align: center; padding: 1.5rem 0 1.8rem 0;
+    border-bottom: 1px solid {BORDER}; margin-bottom: 1.2rem;
 }}
-.sb-brand-icon {{ font-size:2.2rem; margin-bottom:0.4rem; }}
-.sb-brand-name {{
-    font-size:1rem; font-weight:700; color:{TEXT_H};
-    letter-spacing:-0.02em;
-}}
+.sb-brand-icon {{ font-size: 2rem; margin-bottom: 0.4rem; }}
+.sb-brand-name {{ font-size: 0.95rem; font-weight: 700; color: {TEXT_H}; letter-spacing: -0.02em; }}
 .sb-brand-sub {{
-    font-size:0.65rem; text-transform:uppercase;
-    letter-spacing:0.14em; color:{TEXT_MUTED}; margin-top:0.2rem;
+    font-size: 0.62rem; text-transform: uppercase;
+    letter-spacing: 0.16em; color: {TEXT_MUTED}; margin-top: 0.2rem;
 }}
 .sb-sec-title {{
-    font-size:0.62rem; font-weight:700; text-transform:uppercase;
-    letter-spacing:0.18em; color:{TEXT_MUTED};
-    margin:1.3rem 0 0.6rem 0;
+    font-size: 0.6rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.2em; color: {TEXT_MUTED}; margin: 1.3rem 0 0.55rem 0;
 }}
 .sb-chip {{
-    background:{BG_CARD}; border:1px solid {BORDER};
-    border-radius:8px; padding:0.48rem 0.8rem;
-    font-size:0.76rem; color:{TEXT_BODY};
-    margin-bottom:0.35rem; display:block;
-    transition:border-color 0.15s, color 0.15s;
-    cursor:pointer;
+    background: {BG_CARD}; border: 1px solid {BORDER};
+    border-radius: 7px; padding: 0.45rem 0.75rem;
+    font-size: 0.74rem; color: {TEXT_BODY}; margin-bottom: 0.3rem; display: block;
+    transition: border-color 0.15s, color 0.15s, background 0.15s; cursor: pointer;
 }}
-.sb-chip:hover {{ border-color:{BORDER_FOCUS}; color:{TEXT_H}; }}
+.sb-chip:hover {{ border-color: {BORDER_FOCUS}; color: {TEXT_H}; background: {BG_PANEL}; }}
 .sb-stat {{
-    display:flex; justify-content:space-between;
-    padding:0.38rem 0; border-bottom:1px solid {BORDER};
-    font-size:0.76rem;
+    display: flex; justify-content: space-between;
+    padding: 0.36rem 0; border-bottom: 1px solid {BORDER_SUBTLE}; font-size: 0.74rem;
 }}
-.sb-stat:last-child {{ border-bottom:none; }}
-.sb-stat .k {{ color:{TEXT_MUTED}; }}
-.sb-stat .v {{ color:{TEXT_H}; font-weight:600; }}
+.sb-stat:last-child {{ border-bottom: none; }}
+.sb-stat .k {{ color: {TEXT_MUTED}; }}
+.sb-stat .v {{ color: {TEXT_H}; font-weight: 600; }}
 
-/* ── File uploader (light boxes + visible text in both themes) ── */
-[data-testid="stFileUploader"] {{
-    background: transparent !important;
-}}
+/* ═══════════════════════════════════════════════════════════════════════════
+   FILE UPLOADER
+   ═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stFileUploader"] {{ background: transparent !important; }}
 [data-testid="stFileUploader"] > div,
 [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"],
 [data-testid="stFileUploader"] section {{
-    background: {BG_CARD} !important;
-    border: 2px dashed {BORDER} !important;
-    border-radius: 12px !important;
-    color: {TEXT_BODY} !important;
+    background: {BG_CARD} !important; border: 1px dashed {BORDER} !important;
+    border-radius: 10px !important; color: {TEXT_BODY} !important;
+    transition: border-color 0.2s ease !important;
+}}
+[data-testid="stFileUploader"] > div:hover,
+[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"]:hover {{
+    border-color: {BORDER_FOCUS} !important;
 }}
 [data-testid="stFileUploader"] > div *,
 [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] *,
-[data-testid="stFileUploader"] section * {{
-    color: {TEXT_BODY} !important;
-}}
+[data-testid="stFileUploader"] section * {{ color: {TEXT_BODY} !important; }}
 [data-testid="stFileUploader"] small,
-[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] small {{
-    color: {TEXT_MUTED} !important;
-}}
+[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] small {{ color: {TEXT_MUTED} !important; }}
 [data-testid="stFileUploader"] button {{
-    background: linear-gradient({GRAD_BTN}) !important;
-    color: #ffffff !important;
-    border: none !important;
+    background: linear-gradient({GRAD_BTN}) !important; color: #ffffff !important; border: none !important;
 }}
 
-/* ── Toggle ── */
-label[data-testid="stToggle"] span {{ color:{TEXT_BODY} !important; font-size:0.85rem !important; }}
+/* ═══════════════════════════════════════════════════════════════════════════
+   TOGGLE / DOWNLOAD / STATUS
+   ═══════════════════════════════════════════════════════════════════════════ */
+label[data-testid="stToggle"] span {{ color: {TEXT_BODY} !important; font-size: 0.84rem !important; }}
+
+[data-testid="stDownloadButton"] > button {{
+    background: linear-gradient({GRAD_BTN}) !important;
+    color: #ffffff !important; border: none !important; border-radius: 9px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 0.82rem !important; font-weight: 700 !important;
+    letter-spacing: 0.04em !important; padding: 0.5rem 1.4rem !important;
+    margin-top: 0.6rem !important; transition: all 0.22s ease !important;
+    box-shadow: 0 2px 12px {GLOW_BTN} !important;
+}}
+[data-testid="stDownloadButton"] > button:hover {{
+    background: linear-gradient({GRAD_BTN_H}) !important;
+    transform: translateY(-1px) !important; box-shadow: 0 5px 18px {GLOW_BTN} !important;
+}}
+
+[data-testid="stStatusWidget"],
+[data-testid="stStatus"] {{
+    background: {BG_PANEL} !important; border: 1px solid {BORDER} !important;
+    border-radius: 12px !important; box-shadow: {SHADOW} !important; margin-bottom: 0.8rem !important;
+}}
+[data-testid="stStatusWidget"] *, [data-testid="stStatus"] * {{
+    color: {TEXT_BODY} !important; font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 0.87rem !important;
+}}
+[data-testid="stStatusWidget"] p, [data-testid="stStatus"] p {{ color: {TEXT_BODY} !important; }}
+
+/* ═══ SUGGESTION CHIPS ═══════════════════════════════════════════════════════ */
+.sugg-label {{
+    font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: {TEXT_MUTED};
+    margin-bottom: 0.6rem; margin-top: 1.2rem;
+    display: flex; align-items: center; gap: 0.5rem;
+}}
+.sugg-label::before {{
+    content: ''; width: 14px; height: 2px;
+    background: linear-gradient(90deg, #7c3aed, #00f5a0);
+    border-radius: 2px; display: inline-block;
+}}
+/* Style suggestion buttons to look like chips, not full gradient buttons */
+div[data-testid="column"] > div[data-testid="stButton"] > button[kind="secondary"],
+.sugg-btn-row div[data-testid="stButton"] > button {{
+    background: {BG_PANEL} !important;
+    border: 1px solid {BORDER} !important;
+    color: {TEXT_BODY} !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    padding: 0.38rem 0.7rem !important;
+    border-radius: 8px !important;
+    box-shadow: none !important;
+    letter-spacing: 0 !important;
+    transition: border-color 0.15s, color 0.15s, background 0.15s !important;
+    white-space: normal !important;
+    text-align: left !important;
+    line-height: 1.3 !important;
+    height: auto !important;
+}}
+div[data-testid="column"] > div[data-testid="stButton"] > button[kind="secondary"]:hover,
+.sugg-btn-row div[data-testid="stButton"] > button:hover {{
+    border-color: #7c3aed !important;
+    color: {TEXT_H} !important;
+    background: rgba(124,58,237,0.10) !important;
+    transform: none !important;
+    box-shadow: 0 0 0 1px rgba(124,58,237,0.3) !important;
+}}
+/* Sidebar suggestion buttons — same chip style */
+section[data-testid="stSidebar"] div[data-testid="stButton"] > button {{
+    background: {BG_CARD} !important;
+    border: 1px solid {BORDER} !important;
+    color: {TEXT_BODY} !important;
+    font-size: 0.74rem !important; font-weight: 500 !important;
+    padding: 0.38rem 0.7rem !important; border-radius: 7px !important;
+    box-shadow: none !important; letter-spacing: 0 !important;
+    text-align: left !important; white-space: normal !important;
+    line-height: 1.3 !important; height: auto !important;
+    margin-bottom: 0.2rem !important;
+}}
+section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {{
+    border-color: {BORDER_FOCUS} !important;
+    color: {TEXT_H} !important;
+    background: rgba(124,58,237,0.10) !important;
+    transform: none !important; box-shadow: none !important;
+}}
+
+/* ═══ GUIDANCE PANEL ═════════════════════════════════════════════════════════ */
+.guidance-panel {{
+    background: {BG_PANEL}; border: 1px solid {BORDER};
+    border-left: 3px solid #00d4ff; border-radius: 14px;
+    padding: 1.2rem 1.5rem; margin-top: 1.2rem; animation: fadeUp 0.4s ease both;
+}}
+.guidance-title {{
+    font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: #00d4ff; margin-bottom: 0.8rem;
+}}
+.guidance-cols {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.9rem; }}
+.guidance-col-chip {{
+    background: rgba(0,212,255,0.08); border: 1px solid rgba(0,212,255,0.2);
+    border-radius: 6px; padding: 0.22rem 0.6rem; font-size: 0.75rem; font-weight: 600;
+    color: #00d4ff; font-family: 'Fira Code', monospace;
+}}
+.guidance-examples {{ font-size: 0.8rem; color: {TEXT_MUTED}; line-height: 1.7; }}
+.guidance-examples span {{ display: block; padding: 0.15rem 0; }}
+.guidance-examples span::before {{ content: '→ '; color: #7c3aed; }}
+
+/* ═══ FRIENDLY ERROR ══════════════════════════════════════════════════════════ */
+.friendly-err {{
+    background: {BG_PANEL}; border: 1px solid {BORDER};
+    border-left: 3px solid #f87171; border-radius: 14px;
+    padding: 1.3rem 1.5rem; animation: fadeUp 0.3s ease;
+}}
+.friendly-err-title {{ font-size: 0.88rem; font-weight: 700; color: #f87171; margin-bottom: 0.5rem; }}
+.friendly-err-body {{ font-size: 0.85rem; color: {TEXT_BODY}; line-height: 1.65; margin-bottom: 0.8rem; }}
+.friendly-err-cols {{ display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.6rem; }}
+.friendly-err-col {{
+    background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2);
+    border-radius: 5px; padding: 0.18rem 0.5rem; font-size: 0.72rem; font-weight: 600;
+    color: #fca5a5; font-family: 'Fira Code', monospace;
+}}
+
+/* ═══ MOBILE ═════════════════════════════════════════════════════════════════ */
+
+/* Base: prevent ALL horizontal overflow site-wide */
+html, body, .stApp, [data-testid="stAppViewContainer"], .block-container {{
+    max-width: 100vw !important;
+    overflow-x: hidden !important;
+    box-sizing: border-box !important;
+}}
+
+@media (max-width: 900px) {{
+    /* Tighten padding on tablets */
+    .block-container {{ padding: 0 1.2rem 2rem 1.2rem !important; }}
+    .hero {{ padding: 2rem 1.5rem 1.8rem 1.5rem; margin: 0 -1.2rem 1.5rem -1.2rem; }}
+    /* Charts fill full width */
+    .chart-panel {{ padding: 1rem !important; }}
+    /* KPI grid: 2 cols on tablet */
+    .kpi-value {{ font-size: 1.7rem !important; }}
+    /* Tab labels compress */
+    [data-testid="stTabs"] [role="tab"] {{
+        padding: 0.45rem 0.9rem !important; font-size: 0.82rem !important;
+    }}
+}}
+
+@media (max-width: 640px) {{
+    /* Mobile phone layout */
+    .block-container {{ padding: 0 0.8rem 2rem 0.8rem !important; }}
+    .hero {{
+        padding: 1.6rem 1rem 1.4rem 1rem !important;
+        margin: 0 -0.8rem 1.2rem -0.8rem !important;
+    }}
+    .hero h1 {{ font-size: 1.7rem !important; line-height: 1.15 !important; }}
+    .hero-sub {{ font-size: 0.85rem !important; max-width: 100% !important; }}
+    /* Sidebar: full width overlay on mobile (already collapsed by default) */
+    section[data-testid="stSidebar"] {{
+        min-width: 0 !important;
+    }}
+    /* KPI cards: shrink for mobile */
+    .kpi-card {{ padding: 1rem 1.1rem !important; border-radius: 12px !important; }}
+    .kpi-value {{ font-size: 1.5rem !important; }}
+    .kpi-icon {{ font-size: 1.2rem !important; margin-bottom: 0.5rem !important; }}
+    /* Suggestion chips: stack 2×2 */
+    div[data-testid="column"] {{ min-width: 0 !important; }}
+    /* Charts: no min-width */
+    .chart-panel {{ padding: 0.8rem !important; border-radius: 10px !important; }}
+    /* Tab bar: scrollable on very small screens */
+    [data-testid="stTabs"] [role="tablist"] {{
+        overflow-x: auto !important;
+        flex-wrap: nowrap !important;
+        -webkit-overflow-scrolling: touch !important;
+        padding: 3px !important;
+    }}
+    [data-testid="stTabs"] [role="tab"] {{
+        padding: 0.4rem 0.65rem !important;
+        font-size: 0.75rem !important;
+        white-space: nowrap !important;
+        flex-shrink: 0 !important;
+    }}
+    /* Input textarea full width */
+    .stTextArea textarea {{ font-size: 0.95rem !important; }}
+    /* Guidance panel: tighten on mobile */
+    .guidance-panel {{ padding: 0.9rem 1rem !important; }}
+    .guidance-col-chip {{ font-size: 0.68rem !important; }}
+    /* ai-panel on mobile */
+    .ai-panel {{ padding: 1.2rem 1.2rem !important; }}
+    /* section headers */
+    .section-hd {{ margin: 1.5rem 0 0.7rem 0 !important; }}
+    /* workspace-panel */
+    .workspace-panel {{ padding: 0.9rem 1rem !important; }}
+}}
+
+@media (max-width: 400px) {{
+    .hero h1 {{ font-size: 1.4rem !important; }}
+    .kpi-value {{ font-size: 1.3rem !important; }}
+    .hero-eyebrow {{ font-size: 0.55rem !important; letter-spacing: 0.14em !important; }}
+}}
 </style>
 """, unsafe_allow_html=True)
 
-# Force sidebar to be expanded and hide resize handle / tooltip
+# Force sidebar to be expanded and hide resize handle / tooltip and hide resize handle / tooltip
 st.markdown("""
 <script>
 (function() {
@@ -1191,7 +1848,7 @@ with st.sidebar:
     st.markdown('<div class="sb-sec-title">🗂️ Conversation</div>', unsafe_allow_html=True)
     history_count = len(st.session_state.get("query_history", []))
     st.caption(f"{history_count} quer{'y' if history_count == 1 else 'ies'} in history")
-    if st.button("🗑️  Clear Conversation", use_container_width=True):
+    if st.button("🗑️  Clear Conversation", width='stretch'):
         st.session_state.query_history  = []
         st.session_state.result_df      = None
         st.session_state.result_sql     = None
@@ -1200,11 +1857,12 @@ with st.sidebar:
         _save_history([])   # wipe the file too
         st.rerun()
 
-    # Examples — dynamic based on active dataset
-    _ex_title = "💡 Example Questions" if _is_uploaded else "💡 Example Questions (BMW Demo)"
+    # Examples — clickable buttons that populate and auto-run the query
+    _ex_title = "💡 Quick Questions" if _is_uploaded else "💡 Quick Questions (BMW Demo)"
     st.markdown(f'<div class="sb-sec-title">{_ex_title}</div>', unsafe_allow_html=True)
-    for ex in _suggestions:
-        st.markdown(f'<div class="sb-chip">→ {ex}</div>', unsafe_allow_html=True)
+    for _sb_i, _sb_q in enumerate(_suggestions[:6]):
+        if st.button(f"→ {_sb_q}", key=f"sb_sugg_{_sb_i}", width='stretch'):
+            _run_question(_sb_q)
 
     # Dataset overview — dynamic
     if _meta:
@@ -1233,10 +1891,153 @@ with st.sidebar:
             ), unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN — TOP BAR + HERO
+# MAIN — TABBED DASHBOARD LAYOUT
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Ambient background upgrade (injected once after CSS loads) ────────────────
+st.markdown(f"""
+<style>
+.stApp {{
+    background:
+        radial-gradient(circle at 15% 20%, rgba(124,58,237,0.18), transparent 32%),
+        radial-gradient(circle at 82% 72%, rgba(0,245,160,0.10), transparent 35%),
+        radial-gradient(circle at 55% 50%, rgba(0,212,255,0.06), transparent 40%),
+        {BG_PAGE} !important;
+}}
+/* ── Tab bar ── */
+[data-testid="stTabs"] [role="tablist"] {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 14px;
+    padding: 4px;
+    gap: 4px;
+    margin-bottom: 1.8rem;
+}}
+[data-testid="stTabs"] [role="tab"] {{
+    background: transparent !important;
+    border: none !important;
+    border-radius: 10px !important;
+    color: {TEXT_MUTED} !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 0.85rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em !important;
+    padding: 0.55rem 1.3rem !important;
+    transition: all 0.2s ease !important;
+}}
+[data-testid="stTabs"] [role="tab"]:hover {{
+    color: {TEXT_H} !important;
+    background: rgba(124,58,237,0.12) !important;
+}}
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {{
+    background: linear-gradient(135deg,#7c3aed,#5b21b6) !important;
+    color: #ffffff !important;
+    box-shadow: 0 2px 12px rgba(124,58,237,0.45) !important;
+}}
+/* Remove the default Streamlit tab underline */
+[data-testid="stTabs"] [role="tab"][aria-selected="true"]::after,
+[data-testid="stTabs"] [role="tabpanel"] {{ border: none !important; }}
+/* ── Chart panel container ── */
+.chart-panel {{
+    background: linear-gradient(135deg,#161620,#111118);
+    border: 1px solid {BORDER};
+    border-radius: 18px;
+    padding: 1.4rem 1.5rem;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5), 0 1px 0 rgba(255,255,255,0.03);
+}}
+.chart-panel::before {{
+    content: '';
+    position: absolute; top: -40px; right: -40px;
+    width: 160px; height: 160px;
+    background: radial-gradient(circle, rgba(124,58,237,0.10) 0%, transparent 70%);
+    border-radius: 50%; pointer-events: none;
+}}
+.chart-panel-label {{
+    font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: {TEXT_MUTED};
+    margin-bottom: 0.9rem; display: flex; align-items: center; gap: 0.5rem;
+}}
+.chart-panel-label::before {{
+    content: '';
+    width: 12px; height: 2px;
+    background: linear-gradient(90deg,#7c3aed,#00f5a0);
+    border-radius: 2px; display: inline-block;
+}}
+/* ── Analysis workspace ── */
+.workspace-panel {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 16px;
+    padding: 1.2rem 1.4rem;
+    height: 100%;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+}}
+.workspace-label {{
+    font-size: 0.6rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.18em; color: {TEXT_MUTED}; margin-bottom: 0.8rem;
+    display: flex; align-items: center; gap: 0.4rem;
+}}
+/* ── AI Insights tab card ── */
+.ai-panel {{
+    background: linear-gradient(135deg, {BG_CARD} 0%, {BG_CARD2} 100%);
+    border: 1px solid {BORDER};
+    border-top: 2px solid #7c3aed;
+    border-radius: 18px;
+    padding: 2rem 2.2rem;
+    box-shadow: 0 4px 32px rgba(0,0,0,0.5), 0 0 60px rgba(124,58,237,0.08);
+    position: relative; overflow: hidden;
+    animation: fadeUp 0.5s ease both;
+}}
+.ai-panel::after {{
+    content: '';
+    position: absolute; bottom: -60px; right: -60px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(0,245,160,0.08) 0%, transparent 70%);
+    border-radius: 50%; pointer-events: none;
+}}
+.ai-analyst-header {{
+    display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem;
+}}
+.ai-analyst-avatar {{
+    width: 44px; height: 44px; border-radius: 50%;
+    background: linear-gradient(135deg,#7c3aed,#5b21b6);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.2rem; flex-shrink: 0;
+    box-shadow: 0 4px 16px rgba(124,58,237,0.45);
+}}
+.ai-analyst-name {{
+    font-size: 0.95rem; font-weight: 700; color: {TEXT_H};
+    letter-spacing: -0.01em;
+}}
+.ai-analyst-role {{
+    font-size: 0.68rem; color: {TEXT_MUTED};
+    text-transform: uppercase; letter-spacing: 0.14em; margin-top: 0.1rem;
+}}
+.ai-analyst-text {{
+    font-size: 1rem; line-height: 1.8; color: {TEXT_BODY}; font-weight: 400;
+}}
+.ai-empty-state {{
+    text-align: center; padding: 3rem 2rem;
+}}
+.ai-empty-icon {{ font-size: 3rem; margin-bottom: 1rem; opacity: 0.4; }}
+.ai-empty-text {{
+    font-size: 0.9rem; color: {TEXT_MUTED};
+    line-height: 1.6; max-width: 360px; margin: 0 auto;
+}}
+/* ── History tab ── */
+.history-empty {{
+    text-align: center; padding: 3rem;
+    color: {TEXT_MUTED}; font-size: 0.9rem;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Animated top bar ──────────────────────────────────────────────────────────
 st.markdown('<div class="top-bar"></div>', unsafe_allow_html=True)
 
+# ── Hero ──────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="hero">
     <div class="hero-eyebrow">⚡ Powered by Groq · LLaMA 3.3 70B · SQLite &nbsp;·&nbsp; Works with any structured dataset</div>
@@ -1260,6 +2061,15 @@ st.markdown(f"""
         <div class="hero-input-inner">
 """, unsafe_allow_html=True)
 
+# ── Handle pending question from suggestion buttons ──────────────────────────
+# Pattern: set session_state["question_input"] BEFORE the widget renders,
+# then pop pending_question so it only fires once.
+_pending = st.session_state.pop("pending_question", None)
+_auto_run = False
+if _pending:
+    st.session_state["question_input"] = _pending
+    _auto_run = True
+
 question = st.text_area(
     label="question",
     placeholder="e.g. What are the top 10 most expensive cars?",
@@ -1268,25 +2078,38 @@ question = st.text_area(
     key="question_input",
 )
 
-# Run button
 b1, _ = st.columns([1.1, 7])
 with b1:
-    run_btn = st.button("▶  Run Analysis", use_container_width=True)
+    run_btn = st.button("▶  Run Analysis", width='stretch')
+
+# ── Suggestion chips — ALWAYS visible so users can explore ───────────────────
+st.markdown('<div class="sugg-label">Try one of these</div>', unsafe_allow_html=True)
+_sugg_cols = st.columns(4)
+for _si, (_sc, _sq) in enumerate(zip(_sugg_cols, _suggestions[:4])):
+    with _sc:
+        if st.button(_sq, key=f"sugg_{_si}", width='stretch'):
+            _run_question(_sq)
+
+# ── Guidance panel — always visible until a query runs ───────────────────────
+if not st.session_state.get("result_sql"):
+    _render_guidance_panel()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # QUERY EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
-if run_btn:
+if run_btn or _auto_run:
     if not question.strip():
         st.markdown('<div class="warn-box">⚠️ Please enter a question first.</div>',
                     unsafe_allow_html=True)
     else:
-        st.session_state.result_df      = None
-        st.session_state.result_sql     = None
-        st.session_state.result_err     = None
-        st.session_state.result_insight = None
+        st.session_state.result_df           = None
+        st.session_state.result_sql          = None
+        st.session_state.result_err          = None
+        st.session_state.result_insight      = None
+        st.session_state.result_empty_reason = None
 
-        with st.spinner("🤖 Generating SQL…"):
+        with st.status("🤖  Running AI analysis…", expanded=True) as _status:
+            st.write("⚙️  Generating SQL from your question…")
             try:
                 sql = generate_sql(
                     question,
@@ -1294,29 +2117,67 @@ if run_btn:
                     table_name=get_active_table(),
                 )
                 st.session_state.result_sql = sql
+                st.write("✅  SQL generated successfully.")
             except Exception as exc:
-                st.session_state.result_err = f"SQL generation failed: {exc}"
+                _exc_str = str(exc)
+                # Classify the error for a friendly message
+                if "no such column" in _exc_str.lower():
+                    st.session_state.result_err = "__column_error__"
+                elif "rephrase" in _exc_str.lower() or "invalid" in _exc_str.lower():
+                    st.session_state.result_err = (
+                        "I couldn't generate a valid query for that question. "
+                        "Try asking something like: average price by fuel type, "
+                        "top 10 cheapest cars, or count cars by transmission."
+                    )
+                else:
+                    st.session_state.result_err = (
+                        "I couldn't understand that question well enough to query the data. "
+                        "Try asking about: price, fuel type, mileage, year, or transmission."
+                    )
+                st.write(f"❌  {_exc_str}")
+                _status.update(label="❌  Analysis failed", state="error", expanded=True)
 
         if st.session_state.result_sql and not st.session_state.result_err:
-            with st.spinner("⚡ Querying database…"):
+            with st.status("⚡  Querying database…", expanded=True) as _status:
+                st.write("🗄️  Running query against the database…")
                 try:
                     st.session_state.result_df = execute_query_on(st.session_state.result_sql)
+                    _rows = len(st.session_state.result_df)
+                    st.write(f"✅  Query returned {_rows:,} row(s).")
+                    _status.update(label=f"✅  Query complete — {_rows:,} row(s) returned", state="complete", expanded=False)
                 except Exception as exc:
-                    st.session_state.result_err = f"Query execution failed: {exc}"
+                    _exc_str = str(exc)
+                    if "no such column" in _exc_str.lower() or "no such table" in _exc_str.lower():
+                        st.session_state.result_err = "__column_error__"
+                    elif "syntax error" in _exc_str.lower():
+                        st.session_state.result_err = (
+                            "The query had a syntax issue. "
+                            "Try rephrasing — for example: 'average price by fuel type' "
+                            "or 'show top 10 cars by mileage'."
+                        )
+                    else:
+                        st.session_state.result_err = (
+                            "Something went wrong running that query. "
+                            "Try rephrasing or using a simpler question."
+                        )
+                    st.write(f"❌  {_exc_str}")
+                    _status.update(label="❌  Query failed", state="error", expanded=True)
 
-        # Generate AI insight from the results
         if (st.session_state.result_df is not None
                 and not st.session_state.result_df.empty
                 and not st.session_state.result_err):
-            with st.spinner("💡 Generating AI insight…"):
+            with st.status("💡  Generating AI insight…", expanded=True) as _status:
+                st.write("📊  Building visualization…")
+                st.write("✅  Visualization ready.")
+                st.write("🧠  Analysing results with AI…")
                 try:
                     _df   = st.session_state.result_df
-                    _rows = _df.head(20).to_string(index=False)
+                    _rows_str = _df.head(20).to_string(index=False)
                     _cols = ", ".join(_df.columns.tolist())
                     _insight_prompt = (
                         f"A user asked: \"{question}\"\n\n"
                         f"The query returned {len(_df)} rows with columns: {_cols}.\n"
-                        f"Here is a sample of the data:\n{_rows}\n\n"
+                        f"Here is a sample of the data:\n{_rows_str}\n\n"
                         "Write a concise 2-4 sentence insight for a non-technical business user. "
                         "Describe what the results mean, highlight key numbers, note any trends or "
                         "interesting observations. Do NOT mention SQL, tables, or technical terms. "
@@ -1333,10 +2194,45 @@ if run_btn:
                         ],
                     )
                     st.session_state.result_insight = _resp.choices[0].message.content.strip()
+                    st.write("✅  AI insight generated.")
+                    _status.update(label="✅  Analysis complete", state="complete", expanded=False)
                 except Exception:
-                    st.session_state.result_insight = None  # silently skip if insight fails
+                    st.session_state.result_insight = None
+                    st.write("⚠️  AI insight unavailable — skipped.")
+                    _status.update(label="⚠️  Analysis complete (no AI insight)", state="complete", expanded=False)
 
-        # ── Append to query history ───────────────────────────────────────────
+        elif (st.session_state.result_df is not None
+                and st.session_state.result_df.empty
+                and not st.session_state.result_err):
+            with st.status("🔍  Explaining empty result…", expanded=True) as _status:
+                st.write("🧠  Asking AI why no results were found…")
+                try:
+                    _empty_prompt = (
+                        f"A user asked: \"{question}\"\n\n"
+                        f"The query ran successfully but returned zero rows.\n\n"
+                        "In 2-3 plain English sentences:\n"
+                        "1. Explain WHY no results were found.\n"
+                        "2. Suggest a practical alternative they could try instead.\n"
+                        "Do NOT mention SQL, tables, or technical terms. Plain text only."
+                    )
+                    _groq_client = _Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+                    _resp = _groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        temperature=0.3,
+                        max_tokens=160,
+                        messages=[
+                            {"role": "system", "content": "You are a helpful business intelligence assistant."},
+                            {"role": "user",   "content": _empty_prompt},
+                        ],
+                    )
+                    st.session_state.result_empty_reason = _resp.choices[0].message.content.strip()
+                    st.write("✅  Explanation ready.")
+                    _status.update(label="✅  Done", state="complete", expanded=False)
+                except Exception:
+                    st.session_state.result_empty_reason = None
+                    st.write("⚠️  Explanation unavailable.")
+                    _status.update(label="⚠️  Done", state="complete", expanded=False)
+
         if st.session_state.result_sql and not st.session_state.result_err:
             st.session_state.query_history.insert(0, {
                 "question": question,
@@ -1344,88 +2240,357 @@ if run_btn:
                 "insight":  st.session_state.result_insight,
                 "df":       st.session_state.result_df.copy() if st.session_state.result_df is not None else None,
             })
-            # Keep max 10 entries
             st.session_state.query_history = st.session_state.query_history[:10]
             _save_history(st.session_state.query_history)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATASET INTELLIGENCE — dynamic, works for any dataset
+# TABBED WORKSPACE
 # ══════════════════════════════════════════════════════════════════════════════
 
-if _meta:
-    st.markdown('''
-    <div class="section-hd">
-        <span class="section-hd-text">🧠 Dataset Intelligence</span>
-        <div class="section-hd-line"></div>
-    </div>''', unsafe_allow_html=True)
+tab_dash, tab_analysis, tab_ai, tab_history = st.tabs([
+    "📊  Dashboard",
+    "📈  Analysis",
+    "🧠  AI Insights",
+    "🕐  History",
+])
 
-    # Build KPI cards dynamically from detected stats
-    _di_icons   = ["📊","🔢","📈","📉","🏆","🔤"]
-    _di_kpis    = []
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 1 — DASHBOARD  (Dataset Intelligence overview)
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_dash:
 
-    # Always show total rows + columns
-    _di_kpis.append(("📋", "Total Rows",    f"{_meta['total']:,}",  "records in dataset"))
-    _di_kpis.append(("📐", "Total Columns", f"{_meta['n_cols']}",    "fields detected"))
+    # ── Results KPI cards (shown after a query runs) ──────────────────────────
+    df_res       = st.session_state.result_df
+    numeric_cols = df_res.select_dtypes(include="number").columns.tolist() if df_res is not None else []
 
-    # Numeric averages
-    for _ni, (_nc, _nv) in enumerate(_meta.get("num_stats", {}).items()):
-        _icon = ["💹","📊","🔢"][_ni % 3]
-        _di_kpis.append((_icon, f"Avg {_nc.replace('_',' ').title()}", f"{_nv:,.2f}", "average value"))
+    if st.session_state.result_err:
+        _err = st.session_state.result_err
+        if _err == "__column_error__":
+            _render_friendly_error(
+                "This question refers to fields not present in the current dataset.",
+                show_columns=True,
+            )
+        else:
+            _render_friendly_error(_err, show_columns=True)
 
-    # Categorical top values
-    for _ci, (_cc, _cv) in enumerate(_meta.get("cat_stats", {}).items()):
-        _icon = ["🏆","🔖"][_ci % 2]
-        _di_kpis.append((_icon, f"Top {_cc.replace('_',' ').title()}", str(_cv), "most frequent"))
+    elif df_res is not None and not df_res.empty:
+        n = len(df_res)
+        if numeric_cols:
+            _col = numeric_cols[0]
+            _vals = df_res[_col].dropna()
+            kpi_data = [
+                ("🔢", "Rows Returned", f"{n:,}",              "from this query"),
+                ("📈", f"Max {_col}",   f"{_vals.max():,.1f}", f"highest value"),
+                ("📊", f"Avg {_col}",   f"{_vals.mean():,.1f}","mean value"),
+                ("📉", f"Min {_col}",   f"{_vals.min():,.1f}", f"lowest value"),
+            ]
+        else:
+            _ds_total = _meta["total"] if _meta else "—"
+            kpi_data = [
+                ("🔢", "Rows Returned", f"{n:,}",                  "from this query"),
+                ("📋", "Columns",       f"{len(df_res.columns)}",   "in result"),
+                ("📊", "Dataset Rows",  f"{_ds_total:,}" if isinstance(_ds_total, int) else str(_ds_total), "total"),
+                ("✅", "Status",        "Success",                  "query executed"),
+            ]
 
-    _n_kpi_cols = min(len(_di_kpis), 6)
-    _di_cols    = st.columns(_n_kpi_cols)
-    for _di_i, (_di_col, (_di_icon, _di_label, _di_val, _di_sub)) in enumerate(
-            zip(_di_cols, _di_kpis[:_n_kpi_cols])):
-        _di_grad, _di_glow = KPI_COLORS[_di_i % len(KPI_COLORS)]
-        with _di_col:
+        st.markdown("""<div class="section-hd">
+            <span class="section-hd-text">📌 Query Results Overview</span>
+            <div class="section-hd-line"></div></div>""", unsafe_allow_html=True)
+
+        k_cols = st.columns(4)
+        for idx, (k_col, (icon, label, value, sub)) in enumerate(zip(k_cols, kpi_data)):
+            grad, glow = KPI_COLORS[idx % len(KPI_COLORS)]
+            with k_col:
+                st.markdown(f"""
+                <div class="kpi-card" style="animation-delay:{idx*0.08}s">
+                    <div class="kpi-orb" style="background:radial-gradient(circle,{glow} 0%,transparent 70%);"></div>
+                    <span class="kpi-icon">{icon}</span>
+                    <div class="kpi-label">{label}</div>
+                    <div class="kpi-value">{value}</div>
+                    <div class="kpi-sub">{sub}</div>
+                    <div class="kpi-bar" style="background:linear-gradient({grad});"></div>
+                </div>""", unsafe_allow_html=True)
+
+    elif df_res is not None and df_res.empty:
+        _reason = st.session_state.get("result_empty_reason")
+        if _reason:
             st.markdown(f"""
-            <div class="kpi-card" style="animation-delay:{_di_i*0.07}s">
-                <div class="kpi-orb" style="background:radial-gradient(circle,{_di_glow} 0%,transparent 70%);"></div>
-                <span class="kpi-icon">{_di_icon}</span>
-                <div class="kpi-label">{_di_label}</div>
-                <div class="kpi-value">{_di_val}</div>
-                <div class="kpi-sub">{_di_sub}</div>
-                <div class="kpi-bar" style="background:linear-gradient({_di_grad});"></div>
-            </div>
-            """, unsafe_allow_html=True)
+            <div class="insight-card">
+                <div class="insight-avatar">
+                    <div class="insight-avatar-icon">🔍</div>
+                    <div class="insight-avatar-label">No Results — AI Explanation</div>
+                </div>
+                <div class="insight-text">{_reason}</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            _render_friendly_error(
+                "No data matched this question. Try adjusting your filters or asking a different question.",
+                show_columns=True,
+            )
+        if st.session_state.get("result_sql"):
+            with st.expander("🔍  AI Generated SQL", expanded=False):
+                st.code(st.session_state.result_sql, language="sql")
 
-    # AI-generated summary
-    if _ds_summary:
+    # ── Dataset Intelligence KPI cards ────────────────────────────────────────
+    if _meta:
+        st.markdown("""<div class="section-hd">
+            <span class="section-hd-text">🧠 Dataset Intelligence</span>
+            <div class="section-hd-line"></div></div>""", unsafe_allow_html=True)
+
+        _di_kpis = []
+        _di_kpis.append(("📋", "Total Rows",    f"{_meta['total']:,}",  "records in dataset"))
+        _di_kpis.append(("📐", "Total Columns", f"{_meta['n_cols']}",    "fields detected"))
+        for _ni, (_nc, _nv) in enumerate(_meta.get("num_stats", {}).items()):
+            _icon = ["💹","📊","🔢"][_ni % 3]
+            _di_kpis.append((_icon, f"Avg {_nc.replace('_',' ').title()}", f"{_nv:,.2f}", "average value"))
+        for _ci, (_cc, _cv) in enumerate(_meta.get("cat_stats", {}).items()):
+            _icon = ["🏆","🔖"][_ci % 2]
+            _di_kpis.append((_icon, f"Top {_cc.replace('_',' ').title()}", str(_cv), "most frequent"))
+
+        _n_kpi_cols = min(len(_di_kpis), 4)
+        _di_cols    = st.columns(_n_kpi_cols)
+        for _di_i, (_di_col, (_di_icon, _di_label, _di_val, _di_sub)) in enumerate(
+                zip(_di_cols, _di_kpis[:_n_kpi_cols])):
+            _di_grad, _di_glow = KPI_COLORS[_di_i % len(KPI_COLORS)]
+            with _di_col:
+                st.markdown(f"""
+                <div class="kpi-card" style="animation-delay:{_di_i*0.07}s">
+                    <div class="kpi-orb" style="background:radial-gradient(circle,{_di_glow} 0%,transparent 70%);"></div>
+                    <span class="kpi-icon">{_di_icon}</span>
+                    <div class="kpi-label">{_di_label}</div>
+                    <div class="kpi-value">{_di_val}</div>
+                    <div class="kpi-sub">{_di_sub}</div>
+                    <div class="kpi-bar" style="background:linear-gradient({_di_grad});"></div>
+                </div>""", unsafe_allow_html=True)
+
+        # Overflow KPI cards — row 2
+        if len(_di_kpis) > 4:
+            _di_cols2 = st.columns(min(len(_di_kpis) - 4, 4))
+            for _di_i2, (_di_col2, (_di_icon2, _di_label2, _di_val2, _di_sub2)) in enumerate(
+                    zip(_di_cols2, _di_kpis[4:8])):
+                _di_grad2, _di_glow2 = KPI_COLORS[(_di_i2 + 4) % len(KPI_COLORS)]
+                with _di_col2:
+                    st.markdown(f"""
+                    <div class="kpi-card" style="animation-delay:{(_di_i2+4)*0.07}s">
+                        <div class="kpi-orb" style="background:radial-gradient(circle,{_di_glow2} 0%,transparent 70%);"></div>
+                        <span class="kpi-icon">{_di_icon2}</span>
+                        <div class="kpi-label">{_di_label2}</div>
+                        <div class="kpi-value">{_di_val2}</div>
+                        <div class="kpi-sub">{_di_sub2}</div>
+                        <div class="kpi-bar" style="background:linear-gradient({_di_grad2});"></div>
+                    </div>""", unsafe_allow_html=True)
+
+        # AI dataset summary
+        if _ds_summary:
+            st.markdown(f"""
+            <div class="di-section">
+                <div class="di-header">
+                    <div class="di-header-icon">🤖</div>
+                    <div>
+                        <div class="di-header-text">AI Dataset Summary</div>
+                        <div class="di-header-sub">Auto-generated analysis · {_active_label}</div>
+                    </div>
+                </div>
+                <div class="di-summary-label">🧠 &nbsp; Insight</div>
+                <div class="di-summary">{_ds_summary}</div>
+            </div>""", unsafe_allow_html=True)
+    else:
         st.markdown(f"""
-        <div class="di-section">
-            <div class="di-header">
-                <div class="di-header-icon">🤖</div>
+        <div class="ai-empty-state">
+            <div class="ai-empty-icon">📂</div>
+            <div class="ai-empty-text">
+                Upload a CSV dataset using the sidebar to see dataset intelligence cards here,
+                or use the demo BMW dataset — just run any query to get started.
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 2 — ANALYSIS  (chart + table side by side)
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_analysis:
+
+    df_a         = st.session_state.result_df
+    numeric_cols = df_a.select_dtypes(include="number").columns.tolist() if df_a is not None else []
+    text_cols    = df_a.select_dtypes(exclude="number").columns.tolist() if df_a is not None else []
+
+    if st.session_state.result_err:
+        _err_a = st.session_state.result_err
+        if _err_a == "__column_error__":
+            _render_friendly_error(
+                "This question refers to fields not present in the current dataset.",
+                show_columns=True,
+            )
+        else:
+            _render_friendly_error(_err_a, show_columns=True)
+
+    elif df_a is None:
+        st.markdown(f"""
+        <div class="ai-empty-state">
+            <div class="ai-empty-icon">📈</div>
+            <div class="ai-empty-text">
+                Run a query to see your charts and data table here.
+                Results will appear in a 70/30 split — chart on the left, data preview on the right.
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    elif df_a.empty:
+        _render_friendly_error(
+            "No data matched this question. Try adjusting your filters or asking a different question.",
+            show_columns=True,
+        )
+
+    else:
+        n = len(df_a)
+
+        # ── Shared Plotly layout ──────────────────────────────────────────────
+        TL = dict(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=PLOT_BG,
+            font=dict(family="Space Grotesk", color=FONT_CLR, size=11),
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(gridcolor=GRID_CLR, linecolor=GRID_CLR, tickfont=dict(size=10)),
+            yaxis=dict(gridcolor=GRID_CLR, linecolor=GRID_CLR, tickfont=dict(size=10)),
+            coloraxis_showscale=False,
+            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=FONT_CLR, size=10)),
+        )
+
+        if numeric_cols:
+            _cfg       = _pick_chart_config(question, df_a)
+            _icon_map  = {"line":"📈","bar":"📊","bar_h":"📊","histogram":"📉","pie":"🥧","scatter":"🔵"}
+            _chart_icon = _icon_map.get(_cfg["primary"], "📊")
+
+            fig_main = _build_primary_fig(_cfg, df_a, TL)
+
+            # 70 / 30 split: chart panel left, data table right
+            chart_col, table_col = st.columns([7, 3], gap="large")
+
+            with chart_col:
+                st.markdown(f"""
+                <div class="chart-panel">
+                    <div class="chart-panel-label">{_chart_icon} {_cfg['chart_label']}</div>
+                """, unsafe_allow_html=True)
+                st.plotly_chart(fig_main, width='stretch')
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # Secondary chart below primary if available
+                fig2 = _build_secondary_fig(_cfg, df_a, TL)
+                if fig2 is not None:
+                    st.markdown("""
+                    <div class="chart-panel" style="margin-top:1rem;">
+                        <div class="chart-panel-label">📊 Companion View</div>
+                    """, unsafe_allow_html=True)
+                    st.plotly_chart(fig2, width='stretch')
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+            with table_col:
+                st.markdown('<div class="workspace-panel">', unsafe_allow_html=True)
+                st.markdown('<div class="workspace-label">📋 Data Preview</div>',
+                            unsafe_allow_html=True)
+                st.dataframe(df_a, width='stretch', hide_index=True)
+                st.caption(f"✓ {n:,} row(s) · {len(df_a.columns)} col(s)")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # SQL expander in the table column
+                if st.session_state.get("result_sql"):
+                    with st.expander("🔍  Generated SQL", expanded=False):
+                        st.code(st.session_state.result_sql, language="sql")
+
+                # Download button
+                st.download_button(
+                    label="⬇️  Download CSV",
+                    data=df_a.to_csv(index=False).encode("utf-8"),
+                    file_name="query_results.csv",
+                    mime="text/csv",
+                )
+
+        else:
+            # No numeric cols — just show the table full width
+            st.markdown('<div class="chart-panel">', unsafe_allow_html=True)
+            st.markdown('<div class="chart-panel-label">📋 Query Results</div>',
+                        unsafe_allow_html=True)
+            st.dataframe(df_a, width='stretch', hide_index=True)
+            st.caption(f"✓ {n:,} row(s) · {len(df_a.columns)} col(s)")
+            st.markdown("</div>", unsafe_allow_html=True)
+            if st.session_state.get("result_sql"):
+                with st.expander("🔍  Generated SQL", expanded=False):
+                    st.code(st.session_state.result_sql, language="sql")
+            st.download_button(
+                label="⬇️  Download CSV",
+                data=df_a.to_csv(index=False).encode("utf-8"),
+                file_name="query_results.csv",
+                mime="text/csv",
+            )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 3 — AI INSIGHTS
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_ai:
+
+    _insight = st.session_state.get("result_insight")
+    _q_text  = question if question else (
+        st.session_state.query_history[0]["question"]
+        if st.session_state.query_history else ""
+    )
+
+    if _insight:
+        st.markdown(f"""
+        <div class="ai-panel">
+            <div class="ai-analyst-header">
+                <div class="ai-analyst-avatar">🤖</div>
                 <div>
-                    <div class="di-header-text">AI Dataset Summary</div>
-                    <div class="di-header-sub">Auto-generated analysis · {_active_label}</div>
+                    <div class="ai-analyst-name">AI Data Analyst</div>
+                    <div class="ai-analyst-role">Powered by LLaMA 3.3 70B · Groq</div>
                 </div>
             </div>
-            <div class="di-summary-label">🧠 &nbsp; Insight</div>
-            <div class="di-summary">{_ds_summary}</div>
-        </div>
-        """, unsafe_allow_html=True)
+            <div style="font-size:0.72rem;color:{TEXT_MUTED};margin-bottom:0.6rem;
+                        text-transform:uppercase;letter-spacing:0.14em;">
+                Analysing: &ldquo;{_q_text}&rdquo;
+            </div>
+            <div class="ai-analyst-text">{_insight}</div>
+        </div>""", unsafe_allow_html=True)
 
-st.markdown("<br>", unsafe_allow_html=True)
+        # Dataset summary below if available
+        if _ds_summary:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="di-section">
+                <div class="di-header">
+                    <div class="di-header-icon">🧠</div>
+                    <div>
+                        <div class="di-header-text">Dataset Context</div>
+                        <div class="di-header-sub">{_active_label}</div>
+                    </div>
+                </div>
+                <div class="di-summary-label">📊 &nbsp; Background</div>
+                <div class="di-summary">{_ds_summary}</div>
+            </div>""", unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# QUERY HISTORY — single collapsible expander
-# ══════════════════════════════════════════════════════════════════════════════
+    else:
+        st.markdown(f"""
+        <div class="ai-panel">
+            <div class="ai-empty-state">
+                <div class="ai-empty-icon">🧠</div>
+                <div class="ai-empty-text">
+                    Run a query above and the AI analyst will appear here with a plain-English
+                    explanation of your results — trends, key numbers, and what they mean
+                    for your business.
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
 
-_history = st.session_state.get("query_history", [])
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 4 — HISTORY
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_history:
 
-if _history:
-    _btn_label = f"Hide History" if st.session_state.show_history else f"Open History ({len(_history)} {'query' if len(_history)==1 else 'queries'})"
-    if st.button(_btn_label, key="toggle_history_btn"):
-        st.session_state.show_history = not st.session_state.show_history
-        st.rerun()
+    _history = st.session_state.get("query_history", [])
 
-    if st.session_state.show_history:
-        st.markdown("<br>", unsafe_allow_html=True)
+    if not _history:
+        st.markdown("""
+        <div class="history-empty">
+            <div class="ai-empty-icon">🕐</div>
+            <div class="ai-empty-text">No queries yet. Run your first question above.</div>
+        </div>""", unsafe_allow_html=True)
+    else:
         for _i, _entry in enumerate(_history):
             _h_df      = _entry.get("df")
             _h_num     = _h_df.select_dtypes(include="number").columns.tolist() if _h_df is not None else []
@@ -1441,16 +2606,15 @@ if _history:
                         <div class="hist-question">💬 {_entry["question"]}</div>
                         <div class="hist-badge">#{_badge_num}</div>
                     </div>
-                    {"<div class=\"hist-insight\">🤖 " + _insight + "</div>" if _insight else ""}
+                    {"<div class='hist-insight'>🤖 " + _insight + "</div>" if _insight else ""}
                     <div class="hist-num">📊 {_row_count:,} rows returned</div>
-                </div>
-                """, unsafe_allow_html=True)
+                </div>""", unsafe_allow_html=True)
 
                 if _h_df is not None and not _h_df.empty and _h_num:
                     _hy = _h_num[0]
                     _hx = _h_txt[0] if _h_txt else _h_df.columns[0]
                     _hn = len(_h_df)
-                    _TL = dict(
+                    _TL_h = dict(
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=PLOT_BG,
                         font=dict(family="Space Grotesk", color=FONT_CLR, size=10),
                         margin=dict(l=5, r=5, t=10, b=5), height=200,
@@ -1459,188 +2623,21 @@ if _history:
                         coloraxis_showscale=False,
                     )
                     if _hn <= 30:
-                        _fig = px.bar(
+                        _fig_h = px.bar(
                             _h_df.sort_values(_hy, ascending=False).head(10),
                             x=_hx, y=_hy, color=_hy,
                             color_continuous_scale=CHART_SEQ,
                             labels={_hx: _hx.replace("_"," ").title(), _hy: _hy.replace("_"," ").title()},
                         )
                     else:
-                        _fig = px.scatter(
+                        _fig_h = px.scatter(
                             _h_df, x=_hx, y=_hy, color=_hy,
                             color_continuous_scale=CHART_SEQ, opacity=0.7,
                             labels={_hx: _hx.replace("_"," ").title(), _hy: _hy.replace("_"," ").title()},
                         )
-                    _fig.update_layout(**_TL)
-                    _fig.update_traces(marker_line_width=0)
-                    st.plotly_chart(_fig, use_container_width=True, key=f"hist_chart_{_i}")
+                    _fig_h.update_layout(**_TL_h)
+                    _fig_h.update_traces(marker_line_width=0)
+                    st.plotly_chart(_fig_h, width='stretch', key=f"hist_chart_{_i}")
 
             if _i < len(_history) - 1:
                 st.divider()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RESULTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-if st.session_state.result_err:
-    st.markdown(f'<div class="err-box">❌ {st.session_state.result_err}</div>',
-                unsafe_allow_html=True)
-
-elif st.session_state.result_sql:
-    df           = st.session_state.result_df
-    numeric_cols = df.select_dtypes(include="number").columns.tolist() if df is not None else []
-    text_cols    = df.select_dtypes(exclude="number").columns.tolist() if df is not None else []
-
-
-
-    if df is None or df.empty:
-        st.markdown('<div class="warn-box">⚠️ The query returned no results. Try rephrasing your question.</div>',
-                    unsafe_allow_html=True)
-
-    else:
-        st.markdown('<div class="results-wrap">', unsafe_allow_html=True)
-        n = len(df)
-
-        # ── INSIGHTS — KPI cards ──────────────────────────────────────────────
-        def _section(icon, label):
-            st.markdown(f"""
-            <div class="section-hd">
-                <span class="section-hd-text">{icon} {label}</span>
-                <div class="section-hd-line"></div>
-            </div>""", unsafe_allow_html=True)
-
-        _section("📌", "Insights")
-
-        # Build KPIs from query result
-        kpi_data = []
-        if numeric_cols:
-            col = numeric_cols[0]
-            vals = df[col].dropna()
-            kpi_data = [
-                ("🔢", "Row Count",    f"{n:,}",          "rows returned"),
-                ("📈", f"Max {col}",   f"{vals.max():,.1f}", f"highest {col}"),
-                ("📊", f"Avg {col}",   f"{vals.mean():,.1f}","mean value"),
-                ("📉", f"Min {col}",   f"{vals.min():,.1f}", f"lowest {col}"),
-            ]
-        else:
-            _ds_total = _meta["total"] if _meta else "—"
-            kpi_data = [
-                ("🔢", "Row Count",   f"{n:,}",             "rows returned"),
-                ("📋", "Columns",     f"{len(df.columns)}", "in result"),
-                ("📊", "Dataset Rows",f"{_ds_total:,}" if isinstance(_ds_total, int) else str(_ds_total), "total in dataset"),
-                ("🔍", "Query",       "SELECT", "executed successfully"),
-            ]
-
-        k_cols = st.columns(4)
-        for idx, (k_col, (icon, label, value, sub)) in enumerate(zip(k_cols, kpi_data)):
-            grad, glow = KPI_COLORS[idx % len(KPI_COLORS)]
-            with k_col:
-                st.markdown(f"""
-                <div class="kpi-card" style="animation-delay:{idx*0.08}s">
-                    <div class="kpi-orb" style="background:radial-gradient(circle,{glow} 0%,transparent 70%);"></div>
-                    <span class="kpi-icon">{icon}</span>
-                    <div class="kpi-label">{label}</div>
-                    <div class="kpi-value">{value}</div>
-                    <div class="kpi-sub">{sub}</div>
-                    <div class="kpi-bar" style="background:linear-gradient({grad});"></div>
-                </div>
-                """, unsafe_allow_html=True)
-
-        # ── AI INSIGHT ───────────────────────────────────────────────────────────
-        if st.session_state.get("result_insight"):
-            _section("💡", "AI Insight")
-            st.markdown(f"""
-            <div class="insight-card">
-                <div class="insight-avatar">
-                    <div class="insight-avatar-icon">🤖</div>
-                    <div class="insight-avatar-label">AI Analysis · Data Insight</div>
-                </div>
-                <div class="insight-text">{st.session_state.result_insight}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # ── VISUALIZATION ─────────────────────────────────────────────────────
-        if numeric_cols:
-            _section("📊", "Visualization")
-
-            y   = numeric_cols[0]
-            x   = text_cols[0] if text_cols else df.columns[0]
-            TL  = dict(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=PLOT_BG,
-                font=dict(family="Space Grotesk", color=FONT_CLR, size=11),
-                margin=dict(l=10,r=10,t=35,b=10),
-                xaxis=dict(gridcolor=GRID_CLR, linecolor=GRID_CLR, tickfont=dict(size=10)),
-                yaxis=dict(gridcolor=GRID_CLR, linecolor=GRID_CLR, tickfont=dict(size=10)),
-                coloraxis_showscale=False,
-            )
-
-            if n <= 20:
-                # Horizontal bar
-                fig = px.bar(
-                    df.sort_values(y, ascending=True).tail(15),
-                    x=y, y=x, orientation="h",
-                    color=y, color_continuous_scale=CHART_SEQ,
-                    labels={x: x.replace("_"," ").title(), y: y.replace("_"," ").title()},
-                )
-                fig.update_traces(marker_line_width=0, marker_cornerradius=4)
-            elif n <= 80:
-                fig = px.bar(
-                    df, x=x, y=y,
-                    color=y, color_continuous_scale=CHART_SEQ,
-                    labels={x: x.replace("_"," ").title(), y: y.replace("_"," ").title()},
-                )
-                fig.update_traces(marker_line_width=0, marker_cornerradius=4)
-            else:
-                c2 = numeric_cols[1] if len(numeric_cols) > 1 else y
-                fig = px.scatter(
-                    df, x=x, y=y, color=c2,
-                    color_continuous_scale=CHART_SEQ, opacity=0.75,
-                    labels={x: x.replace("_"," ").title(), y: y.replace("_"," ").title()},
-                )
-            fig.update_layout(**TL)
-
-            c_left, c_right = st.columns([3, 2], gap="large")
-            with c_left:
-                st.plotly_chart(fig, use_container_width=True)
-
-            # Second chart — pie or scatter
-            with c_right:
-                if text_cols and n <= 30:
-                    # Pie / donut
-                    fig2 = go.Figure(go.Pie(
-                        labels=df[x], values=df[y],
-                        hole=0.55,
-                        marker=dict(colors=CHART_DISC, line=dict(color=BG_PAGE, width=2)),
-                        textfont=dict(family="Space Grotesk", size=11, color=FONT_CLR),
-                    ))
-                    fig2.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        font=dict(family="Space Grotesk", color=FONT_CLR),
-                        margin=dict(l=10,r=10,t=35,b=10),
-                        showlegend=True,
-                        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=FONT_CLR, size=10)),
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
-                elif len(numeric_cols) >= 2:
-                    fig2 = px.scatter(
-                        df, x=numeric_cols[0], y=numeric_cols[1],
-                        color=text_cols[0] if text_cols else None,
-                        color_discrete_sequence=CHART_DISC, opacity=0.8,
-                        labels={c: c.replace("_"," ").title() for c in df.columns},
-                    )
-                    fig2.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=PLOT_BG,
-                        font=dict(family="Space Grotesk", color=FONT_CLR, size=11),
-                        margin=dict(l=10,r=10,t=35,b=10),
-                        xaxis=dict(gridcolor=GRID_CLR), yaxis=dict(gridcolor=GRID_CLR),
-                        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=FONT_CLR)),
-                        coloraxis_showscale=False,
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
-
-        # ── RESULT TABLE ──────────────────────────────────────────────────────
-        _section("📋", "Result Table")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.caption(f"✓ {n:,} row(s) · {len(df.columns)} column(s) returned")
-
-        st.markdown('</div>', unsafe_allow_html=True)
