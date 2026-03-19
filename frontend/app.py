@@ -588,95 +588,28 @@ def _get_dataset_columns() -> list[str]:
         return []
 
 
-def _render_friendly_error(message: str, show_columns: bool = True,
-                           error_type: str = "generic") -> None:
-    """Render a styled, friendly error card with icon, explanation, and column hints."""
-
-    # ── Per-type copy ─────────────────────────────────────────────────────────
-    _cfg = {
-        "column_error": {
-            "icon":  "🔍",
-            "title": "Column not found in this dataset",
-            "body":  (
-                "Your question mentioned a field that doesn't exist in the current data. "
-                "Check the available columns below and try again — "
-                "for example: <em>average price by fuel type</em> or <em>top 10 by mileage</em>."
-            ),
-        },
-        "irrelevant": {
-            "icon":  "🤔",
-            "title": "That doesn't look like a data question",
-            "body":  (
-                "I can only answer questions about the data in this dashboard — things like prices, "
-                "counts, averages, and comparisons. Try something like: "
-                "<em>What's the average price by fuel type?</em> or "
-                "<em>Show me the top 10 most expensive cars.</em>"
-            ),
-        },
-        "syntax_error": {
-            "icon":  "⚙️",
-            "title": "Couldn't build a valid query from that",
-            "body":  (
-                "The question was understood but something went wrong generating the query. "
-                "Try rephrasing — keep it simple and specific, like "
-                "<em>count cars by transmission</em> or <em>average mileage by model</em>."
-            ),
-        },
-        "empty_result": {
-            "icon":  "📭",
-            "title": "No data matched your question",
-            "body":  (
-                "The query ran fine but returned zero rows — the filter may be too specific "
-                "or the value you mentioned might not exist in the data. "
-                "Try broadening your question or removing a filter."
-            ),
-        },
-        "generic": {
-            "icon":  "⚠️",
-            "title": "Something went wrong",
-            "body":  (
-                "We couldn't process that question. Try rephrasing it using simpler terms "
-                "like <em>average</em>, <em>top 10</em>, or <em>count by category</em>. "
-                "The available columns below might help you craft a better question."
-            ),
-        },
-    }
-    cfg = _cfg.get(error_type, _cfg["generic"])
-
-    # Override title/body if a custom message was passed (non-sentinel value)
-    display_body = cfg["body"]
-    if message and message not in ("__column_error__",):
-        display_body = message
-
+def _render_friendly_error(message: str, show_columns: bool = True) -> None:
+    """Render a styled, friendly error card with optional column list."""
     cols_html = ""
     if show_columns:
         cols = _get_dataset_columns()
         if cols:
             chips = "".join(f'<span class="friendly-err-col">{c}</span>' for c in cols)
             cols_html = f"""
-            <div style="margin-top:1rem;padding-top:0.9rem;
-                        border-top:1px solid rgba(248,113,113,0.2);">
-                <div style="font-size:0.65rem;font-weight:700;text-transform:uppercase;
-                            letter-spacing:0.16em;color:#f87171;margin-bottom:0.5rem;">
-                    📋 &nbsp;Available columns you can ask about
+            <div style="margin-top:0.7rem;">
+                <div style="font-size:0.68rem;font-weight:700;text-transform:uppercase;
+                            letter-spacing:0.14em;color:#f87171;margin-bottom:0.45rem;">
+                    Available columns
                 </div>
                 <div class="friendly-err-cols">{chips}</div>
             </div>"""
-
-    # ── Example questions ─────────────────────────────────────────────────────
-    _ex = _suggestions[:3]
-    examples_html = "".join(
-        f'<div class="friendly-err-example">💬 {q}</div>' for q in _ex
-    ) if _ex else ""
-
     st.markdown(f"""
     <div class="friendly-err">
-        <div class="friendly-err-icon-row">
-            <span class="friendly-err-icon">{cfg["icon"]}</span>
-            <div class="friendly-err-title">{cfg["title"]}</div>
+        <div class="friendly-err-title">⚠️ &nbsp;{message}</div>
+        <div class="friendly-err-body">
+            Try asking about the columns listed below, or rephrase your question
+            using simpler terms like <em>average</em>, <em>top 10</em>, or <em>count by category</em>.
         </div>
-        <div class="friendly-err-body">{display_body}</div>
-        {f'<div class="friendly-err-examples">{examples_html}</div>' if examples_html else ""}
         {cols_html}
     </div>""", unsafe_allow_html=True)
 
@@ -720,7 +653,6 @@ for k, v in {
     "result_df":           None,
     "result_sql":          None,
     "result_err":          None,
-    "result_err_type":     "generic",
     "result_insight":      None,
     "result_empty_reason": None,
     "query_history":       _load_history(),
@@ -808,8 +740,10 @@ else:
     BG_CARD        = "#ffffff"
     BG_CARD2       = "#fdf2f5"
     BG_INPUT       = "#fff0f3"
+    BG_PANEL       = "#fce7f0"
     BORDER         = "#f9a8c9"
     BORDER_FOCUS   = "#e11d6a"
+    BORDER_SUBTLE  = "#fdd5e6"
     TEXT_H         = "#1a0010"
     TEXT_BODY      = "#5a1a35"
     TEXT_MUTED     = "#c084a0"
@@ -818,11 +752,14 @@ else:
     GRAD_BTN_H     = "135deg,#be185d 0%,#ea580c 100%"
     GRAD_HERO      = "135deg,#fff5f7 0%,#ffe4ef 50%,#fff5f7 100%"
     GRAD_CARD      = "135deg,#ffffff,#fff0f3"
+    GRAD_KPI       = "135deg,#fdf2f5 0%,#ffffff 100%"
     GLOW_BTN       = "rgba(225,29,106,0.45)"
     GLOW_INPUT     = "rgba(225,29,106,0.18)"
     GLOW_CARD      = "rgba(225,29,106,0.08)"
     GLOW_GREEN     = "rgba(249,115,22,0.10)"
+    GLOW_BLUE      = "rgba(225,29,106,0.08)"
     SHADOW         = "0 4px 32px rgba(225,29,106,0.10)"
+    SHADOW_DEEP    = "0 8px 40px rgba(225,29,106,0.15), 0 1px 0 rgba(255,255,255,0.8)"
     CHART_SEQ      = [[0,"#ffe4ef"],[0.5,"#e11d6a"],[1,"#f97316"]]
     CHART_DISC     = ["#e11d6a","#f97316","#f59e0b","#8b5cf6","#10b981","#0ea5e9"]
     PLOT_BG        = "#fff5f7"
@@ -1474,19 +1411,43 @@ section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {{
     border-radius: 5px; padding: 0.18rem 0.5rem; font-size: 0.72rem; font-weight: 600;
     color: #fca5a5; font-family: 'Fira Code', monospace;
 }}
-.friendly-err-icon-row {{
-    display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.55rem;
+
+/* ═══ RESULTS SUMMARY TABLE ════════════════════════════════════════════════ */
+.res-tbl-wrap {{
+    background: {BG_PANEL}; border: 1px solid {BORDER};
+    border-radius: 14px; padding: 1.2rem 1.5rem; margin-top: 1.4rem;
+    box-shadow: {SHADOW};
 }}
-.friendly-err-icon {{
-    font-size: 1.55rem; line-height: 1; flex-shrink: 0;
+.res-tbl-title {{
+    font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.16em; color: {BORDER_FOCUS}; margin-bottom: 0.9rem;
 }}
-.friendly-err-examples {{
-    margin-top: 0.85rem; display: flex; flex-direction: column; gap: 0.35rem;
+.res-tbl {{
+    width: 100%; border-collapse: collapse; font-family: 'Space Grotesk', sans-serif;
 }}
-.friendly-err-example {{
-    font-size: 0.81rem; color: {TEXT_MUTED}; font-style: italic;
-    padding: 0.28rem 0.7rem; background: {BG_INPUT}; border-radius: 6px;
-    border-left: 2px solid {BORDER_FOCUS};
+.res-tbl-hdr {{
+    font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.12em; color: {TEXT_MUTED};
+    padding: 0.45rem 0.9rem; text-align: right;
+    border-bottom: 1px solid {BORDER};
+}}
+.res-tbl-hdr-first {{ text-align: left; }}
+.res-tbl-metric {{
+    font-size: 0.82rem; font-weight: 600; color: {TEXT_H};
+    padding: 0.55rem 0.9rem; text-align: left;
+    border-bottom: 1px solid {BORDER_SUBTLE};
+    white-space: nowrap;
+}}
+.res-tbl-cell {{
+    font-size: 0.82rem; color: {TEXT_BODY}; font-variant-numeric: tabular-nums;
+    padding: 0.55rem 0.9rem; text-align: right;
+    border-bottom: 1px solid {BORDER_SUBTLE};
+}}
+.res-tbl tr:last-child .res-tbl-metric,
+.res-tbl tr:last-child .res-tbl-cell {{ border-bottom: none; }}
+.res-tbl tr:hover .res-tbl-metric,
+.res-tbl tr:hover .res-tbl-cell {{
+    background: {BG_INPUT} !important; color: {TEXT_H};
 }}
 
 /* ═══ MOBILE ═════════════════════════════════════════════════════════════════ */
@@ -1889,11 +1850,16 @@ with st.sidebar:
             st.session_state.active_table    = "data"
             st.session_state.active_label    = _uploaded_file.name
             _save_dataset_meta(_uploaded_file.name, _schema_str, "data")
-            st.session_state.result_df      = None
-            st.session_state.result_sql     = None
-            st.session_state.result_err     = None
-            st.session_state.result_err_type = "generic"
-            st.session_state.result_insight = None
+            # Wipe all previous results — they belong to the old dataset
+            st.session_state.result_df           = None
+            st.session_state.result_sql          = None
+            st.session_state.result_err          = None
+            st.session_state.result_err_type     = "generic"
+            st.session_state.result_insight      = None
+            st.session_state.result_empty_reason = None
+            # Clear history — old queries don't apply to the new schema
+            st.session_state.query_history       = []
+            _save_history([])
             load_dynamic_meta.clear()
             load_dynamic_summary.clear()
             load_sidebar_breakdown.clear()
@@ -1909,10 +1875,21 @@ with st.sidebar:
             unsafe_allow_html=True
         )
         if st.button("✕  Remove dataset", key="remove_dataset"):
+            # Clear dataset references
             st.session_state.uploaded_db   = None
             st.session_state.active_schema = None
             st.session_state.active_table  = "cars"
             st.session_state.active_label  = None
+            # Wipe all results — they belong to the removed dataset
+            st.session_state.result_df           = None
+            st.session_state.result_sql          = None
+            st.session_state.result_err          = None
+            st.session_state.result_err_type     = "generic"
+            st.session_state.result_insight      = None
+            st.session_state.result_empty_reason = None
+            # Clear history — queries from the old dataset are meaningless now
+            st.session_state.query_history       = []
+            _save_history([])
             _clear_persisted_dataset()
             load_dynamic_meta.clear()
             load_dynamic_summary.clear()
@@ -1936,7 +1913,6 @@ with st.sidebar:
         st.session_state.result_df      = None
         st.session_state.result_sql     = None
         st.session_state.result_err     = None
-        st.session_state.result_err_type = "generic"
         st.session_state.result_insight = None
         _save_history([])   # wipe the file too
         st.rerun()
@@ -2189,80 +2165,37 @@ if run_btn or _auto_run:
         st.session_state.result_df           = None
         st.session_state.result_sql          = None
         st.session_state.result_err          = None
-        st.session_state.result_err_type     = "generic"
         st.session_state.result_insight      = None
         st.session_state.result_empty_reason = None
 
-        # ── Pre-flight: use LLM to classify whether the question is data-related ──
-        def _is_data_question(q: str) -> bool:
-            """Return True if the question is answerable by querying a dataset."""
-            try:
-                _groq = _Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
-                _clf = _groq.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    temperature=0.0,
-                    max_tokens=5,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a classifier. The user is using a data analytics dashboard. "
-                                "Decide if their message is a genuine data/analytics question that can be "
-                                "answered by querying a dataset (e.g. counts, averages, filters, comparisons, "
-                                "trends, rankings). Reply with exactly one word: YES or NO. "
-                                "Reply NO for greetings, personal questions, general knowledge, weather, "
-                                "jokes, or anything unrelated to analysing tabular data."
-                            ),
-                        },
-                        {"role": "user", "content": q},
-                    ],
-                )
-                answer = _clf.choices[0].message.content.strip().upper()
-                return answer.startswith("YES")
-            except Exception:
-                return True   # fail open — let generate_sql handle it
-
         with st.status("🤖  Running AI analysis…", expanded=True) as _status:
-            st.write("🔍  Checking if question is data-related…")
-            if not _is_data_question(question):
-                st.session_state.result_err      = "irrelevant"
-                st.session_state.result_err_type = "irrelevant"
-                st.write("❌  Question is not related to the dataset.")
-                _status.update(label="❌  Not a data question", state="error", expanded=True)
-            else:
-                st.write("⚙️  Generating SQL from your question…")
-                try:
-                    sql = generate_sql(
-                        question,
-                        schema=get_active_schema(),
-                        table_name=get_active_table(),
+            st.write("⚙️  Generating SQL from your question…")
+            try:
+                sql = generate_sql(
+                    question,
+                    schema=get_active_schema(),
+                    table_name=get_active_table(),
+                )
+                st.session_state.result_sql = sql
+                st.write("✅  SQL generated successfully.")
+            except Exception as exc:
+                _exc_str = str(exc)
+                # Classify the error for a friendly message
+                if "no such column" in _exc_str.lower():
+                    st.session_state.result_err = "__column_error__"
+                elif "rephrase" in _exc_str.lower() or "invalid" in _exc_str.lower():
+                    st.session_state.result_err = (
+                        "I couldn't generate a valid query for that question. "
+                        "Try asking something like: average price by fuel type, "
+                        "top 10 cheapest cars, or count cars by transmission."
                     )
-                    st.session_state.result_sql = sql
-                    st.write("✅  SQL generated successfully.")
-                except Exception as exc:
-                    _exc_str = str(exc).lower()
-                    _irrelevant_signals = [
-                        "not a data", "not related", "cannot answer", "out of scope",
-                        "not relevant", "don't understand", "doesn't relate",
-                        "not a valid", "cannot generate", "no data question",
-                        "unrelated", "nonsense", "not a question about",
-                    ]
-                    _column_signals = ["no such column", "column", "field", "attribute"]
-                    _syntax_signals = ["rephrase", "invalid", "syntax", "parse", "ambiguous"]
-                    if any(s in _exc_str for s in _irrelevant_signals):
-                        st.session_state.result_err      = "irrelevant"
-                        st.session_state.result_err_type = "irrelevant"
-                    elif any(s in _exc_str for s in _column_signals):
-                        st.session_state.result_err      = "__column_error__"
-                        st.session_state.result_err_type = "column_error"
-                    elif any(s in _exc_str for s in _syntax_signals):
-                        st.session_state.result_err      = "syntax_error"
-                        st.session_state.result_err_type = "syntax_error"
-                    else:
-                        st.session_state.result_err      = "generic"
-                        st.session_state.result_err_type = "generic"
-                    st.write(f"❌  {str(exc)}")
-                    _status.update(label="❌  Analysis failed", state="error", expanded=True)
+                else:
+                    st.session_state.result_err = (
+                        "I couldn't understand that question well enough to query the data. "
+                        "Try asking about: price, fuel type, mileage, year, or transmission."
+                    )
+                st.write(f"❌  {_exc_str}")
+                _status.update(label="❌  Analysis failed", state="error", expanded=True)
 
         if st.session_state.result_sql and not st.session_state.result_err:
             with st.status("⚡  Querying database…", expanded=True) as _status:
@@ -2273,17 +2206,21 @@ if run_btn or _auto_run:
                     st.write(f"✅  Query returned {_rows:,} row(s).")
                     _status.update(label=f"✅  Query complete — {_rows:,} row(s) returned", state="complete", expanded=False)
                 except Exception as exc:
-                    _exc_str = str(exc).lower()
-                    if "no such column" in _exc_str or "no such table" in _exc_str:
-                        st.session_state.result_err      = "__column_error__"
-                        st.session_state.result_err_type = "column_error"
-                    elif "syntax error" in _exc_str or "parse" in _exc_str:
-                        st.session_state.result_err      = "syntax_error"
-                        st.session_state.result_err_type = "syntax_error"
+                    _exc_str = str(exc)
+                    if "no such column" in _exc_str.lower() or "no such table" in _exc_str.lower():
+                        st.session_state.result_err = "__column_error__"
+                    elif "syntax error" in _exc_str.lower():
+                        st.session_state.result_err = (
+                            "The query had a syntax issue. "
+                            "Try rephrasing — for example: 'average price by fuel type' "
+                            "or 'show top 10 cars by mileage'."
+                        )
                     else:
-                        st.session_state.result_err      = "generic"
-                        st.session_state.result_err_type = "generic"
-                    st.write(f"❌  {str(exc)}")
+                        st.session_state.result_err = (
+                            "Something went wrong running that query. "
+                            "Try rephrasing or using a simpler question."
+                        )
+                    st.write(f"❌  {_exc_str}")
                     _status.update(label="❌  Query failed", state="error", expanded=True)
 
         if (st.session_state.result_df is not None
@@ -2387,9 +2324,14 @@ with tab_dash:
     numeric_cols = df_res.select_dtypes(include="number").columns.tolist() if df_res is not None else []
 
     if st.session_state.result_err:
-        _err      = st.session_state.result_err
-        _err_type = st.session_state.get("result_err_type", "generic")
-        _render_friendly_error(_err, show_columns=True, error_type=_err_type)
+        _err = st.session_state.result_err
+        if _err == "__column_error__":
+            _render_friendly_error(
+                "This question refers to fields not present in the current dataset.",
+                show_columns=True,
+            )
+        else:
+            _render_friendly_error(_err, show_columns=True)
 
     elif df_res is not None and not df_res.empty:
         n = len(df_res)
@@ -2428,6 +2370,43 @@ with tab_dash:
                     <div class="kpi-sub">{sub}</div>
                     <div class="kpi-bar" style="background:linear-gradient({grad});"></div>
                 </div>""", unsafe_allow_html=True)
+
+        # ── Summary stats table (numeric columns only) ────────────────────────
+        if numeric_cols:
+            _tbl_rows_html = ""
+            for _i, _nc in enumerate(numeric_cols):
+                _v = df_res[_nc].dropna()
+                _row_bg = f"background:{BG_INPUT};" if _i % 2 == 0 else ""
+                _tbl_rows_html += f"""
+                <tr style="{_row_bg}">
+                    <td class="res-tbl-metric">{_nc.replace('_',' ').title()}</td>
+                    <td class="res-tbl-cell">{len(_v):,}</td>
+                    <td class="res-tbl-cell">{_v.min():,.2f}</td>
+                    <td class="res-tbl-cell">{_v.max():,.2f}</td>
+                    <td class="res-tbl-cell">{_v.mean():,.2f}</td>
+                    <td class="res-tbl-cell">{_v.median():,.2f}</td>
+                    <td class="res-tbl-cell">{_v.std():,.2f}</td>
+                </tr>"""
+            st.markdown(f"""
+            <div class="res-tbl-wrap">
+                <div class="res-tbl-title">📋 &nbsp;Column Statistics</div>
+                <div style="overflow-x:auto;">
+                <table class="res-tbl">
+                    <thead>
+                        <tr>
+                            <th class="res-tbl-hdr res-tbl-hdr-first">Column</th>
+                            <th class="res-tbl-hdr">Count</th>
+                            <th class="res-tbl-hdr">Min</th>
+                            <th class="res-tbl-hdr">Max</th>
+                            <th class="res-tbl-hdr">Average</th>
+                            <th class="res-tbl-hdr">Median</th>
+                            <th class="res-tbl-hdr">Std Dev</th>
+                        </tr>
+                    </thead>
+                    <tbody>{_tbl_rows_html}</tbody>
+                </table>
+                </div>
+            </div>""", unsafe_allow_html=True)
 
     elif df_res is not None and df_res.empty:
         _reason = st.session_state.get("result_empty_reason")
@@ -2532,9 +2511,14 @@ with tab_analysis:
     text_cols    = df_a.select_dtypes(exclude="number").columns.tolist() if df_a is not None else []
 
     if st.session_state.result_err:
-        _err_a    = st.session_state.result_err
-        _err_type_a = st.session_state.get("result_err_type", "generic")
-        _render_friendly_error(_err_a, show_columns=True, error_type=_err_type_a)
+        _err_a = st.session_state.result_err
+        if _err_a == "__column_error__":
+            _render_friendly_error(
+                "This question refers to fields not present in the current dataset.",
+                show_columns=True,
+            )
+        else:
+            _render_friendly_error(_err_a, show_columns=True)
 
     elif df_a is None:
         st.markdown(f"""
@@ -2549,7 +2533,7 @@ with tab_analysis:
     elif df_a.empty:
         _render_friendly_error(
             "No data matched this question. Try adjusting your filters or asking a different question.",
-            show_columns=True, error_type="empty_result",
+            show_columns=True,
         )
 
     else:
